@@ -57,8 +57,7 @@ builds:
       - -X github.com/rancher/fleet/pkg/version.GitCommit={{ .Commit }}
       - -X github.com/rancher/fleet/pkg/version.Version={{ .Tag }}
     targets:
-    - linux_amd64_v1
-    - linux_arm64
+    - linux_s390x
   -
     id: fleet-agent
     main: ./cmd/fleetagent
@@ -69,9 +68,7 @@ builds:
       - -X github.com/rancher/fleet/pkg/version.GitCommit={{ .Commit }}
       - -X github.com/rancher/fleet/pkg/version.Version={{ .Tag }}
     targets:
-    - linux_amd64_v1
-    - linux_arm64
-    - windows_amd64
+    - linux_s390x
   -
     id: fleet-cli
     main: ./cmd/fleetcli
@@ -82,10 +79,7 @@ builds:
       - -X github.com/rancher/fleet/pkg/version.GitCommit={{ .Commit }}
       - -X github.com/rancher/fleet/pkg/version.Version={{ .Tag }}
     targets:
-    - darwin_arm64
-    - linux_amd64_v1
-    - linux_arm64
-    - windows_amd64
+    - linux_s390x
   -
     id: fleet-benchmark
     main: ./benchmarks/cmd
@@ -96,10 +90,7 @@ builds:
       - -X github.com/rancher/fleet/pkg/version.GitCommit={{ .Commit }}
       - -X github.com/rancher/fleet/pkg/version.Version={{ .Tag }}
     targets:
-    - darwin_arm64
-    - linux_amd64_v1
-    - linux_arm64
-    - windows_amd64
+    - linux_s390x
 
 snapshot:
   version_template: "{{ .Tag }}-next"
@@ -108,50 +99,15 @@ dockers:
   # fleet-controller images
   -
     use: buildx
-    id: fleet-amd64-public
-    skip_push: "{{ .Env.IS_HOTFIX }}"
-
-    # GOOS of the built binaries/packages that should be used.
-    goos: linux
-
-    # GOARCH of the built binaries/packages that should be used.
-    goarch: amd64
-
-    # IDs to filter the binaries/packages.
-    ids:
-    - fleet-controller
-    - fleet-cli
-
-    # Templates of the Docker image names.
-    image_templates:
-    - "docker.io/rancher/fleet:{{ .Tag }}-linux-amd64"
-
-    # Path to the Dockerfile (from the project root).
-    dockerfile: package/Dockerfile
-
-    # Template of the docker build flags.
-    build_flag_templates:
-    - "--pull"
-    - "--label=org.opencontainers.image.created={{.Date}}"
-    - "--label=org.opencontainers.image.title={{.ProjectName}}"
-    - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-    - "--label=org.opencontainers.image.version={{.Version}}"
-    - "--label=org.opencontainers.image.source=https://github.com/rancher/fleet"
-    - "--build-arg=ARCH=amd64"
-    - "--build-arg=BUILD_ENV=goreleaser"
-    - "--platform=linux/amd64"
-    extra_files: [ "package/log.sh" ]
-  -
-    use: buildx
-    id: fleet-arm64-public
+    id: fleet-s390x-public
     skip_push: "{{ .Env.IS_HOTFIX }}"
     goos: linux
-    goarch: arm64
+    goarch: s390x
     ids:
     - fleet-controller
     - fleet-cli
     image_templates:
-    - "docker.io/rancher/fleet:{{ .Tag }}-linux-arm64"
+    - "ghcr.io/dnse-tech/fleet:{{ .Tag }}-linux-s390x"
     dockerfile: package/Dockerfile
     build_flag_templates:
     - "--pull"
@@ -160,21 +116,21 @@ dockers:
     - "--label=org.opencontainers.image.revision={{.FullCommit}}"
     - "--label=org.opencontainers.image.version={{.Version}}"
     - "--label=org.opencontainers.image.source=https://github.com/rancher/fleet"
-    - "--build-arg=ARCH=arm64"
+    - "--build-arg=ARCH=s390x"
     - "--build-arg=BUILD_ENV=goreleaser"
-    - "--platform=linux/arm64/v8"
+    - "--platform=linux/s390x"
     extra_files: [ "package/log.sh" ]
   # fleet-agent images
   -
     use: buildx
-    id: fleet-agent-amd64-public
+    id: fleet-agent-s390x-public
     skip_push: "{{ .Env.IS_HOTFIX }}"
     goos: linux
-    goarch: amd64
+    goarch: s390x
     ids:
     - fleet-agent
     image_templates:
-    - "docker.io/rancher/fleet-agent:{{ .Tag }}-linux-amd64"
+    - "ghcr.io/dnse-tech/fleet-agent:{{ .Tag }}-linux-s390x"
     dockerfile: package/Dockerfile.agent
     build_flag_templates:
     - "--pull"
@@ -183,7 +139,7 @@ dockers:
     - "--label=org.opencontainers.image.revision={{.FullCommit}}"
     - "--label=org.opencontainers.image.version={{.Version}}"
     - "--label=org.opencontainers.image.source=https://github.com/rancher/fleet"
-    - "--build-arg=ARCH=amd64"
+    - "--build-arg=ARCH=s390x"
     - "--build-arg=BUILD_ENV=goreleaser"
     - "--platform=linux/amd64"
   -
