@@ -35,6 +35,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.tag || github.ref }}
 
+      - name: Use goreleaser config from main
+        if: inputs.tag
+        run: |
+          # Fetch updated goreleaser config with s390x support from main
+          git show origin/main:.goreleaser.yaml > .goreleaser.yaml
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
