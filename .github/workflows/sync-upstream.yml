@@ -1,0 +1,80 @@
+# Sync releases from upstream rancher/fleet
+name: Sync Upstream Releases
+
+on:
+  schedule:
+    - cron: "0 17 * * *"  # Daily at 17:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.repository == 'dnse-tech/fleet'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new upstream releases
+        id: check
+        run: |
+          # Get latest stable release from rancher/fleet (exclude rc/alpha/beta)
+          LATEST=$(gh release list -R rancher/fleet --limit 20 --json tagName,isPrerelease \
+            | jq -r '[.[] | select(.isPrerelease == false)] | first | .tagName // empty')
+
+          if [ -z "$LATEST" ]; then
+            echo "No stable release found"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "upstream_tag=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest upstream stable tag: $LATEST"
+
+          # Check if we already have this release
+          if gh release view "$LATEST" &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release $LATEST already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "New release found: $LATEST"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream code
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.check.outputs.upstream_tag }}"
+
+          # Add upstream remote and fetch the tag
+          git remote add upstream https://github.com/rancher/fleet.git || true
+          git fetch upstream tag "$TAG" --no-tags
+
+          # Merge upstream tag into main (fast-forward if possible)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create or update the tag to point to upstream's commit
+          git tag -f "$TAG" "upstream/$TAG^{}"
+          git push origin "$TAG" --force
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create matching release
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.check.outputs.upstream_tag }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "Synced from rancher/fleet $TAG
+
+          Upstream: https://github.com/rancher/fleet/releases/tag/$TAG
+
+          This release adds s390x architecture support to GHCR."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
