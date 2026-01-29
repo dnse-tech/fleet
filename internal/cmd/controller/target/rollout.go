@@ -18,7 +18,13 @@ func partitions(targets []*Target) ([]partition, error) {
 	return manualPartition(rollout, targets)
 }
 
-// getRollout returns the rollout strategy for the specified targets (pure function)
+// getRollout returns the rollout strategy for the specified targets (pure
+// function).
+//
+// If targets contains several elements, the rollout strategy of the first
+// element is used. If no rollout strategy is found, an empty one is created
+// and returned. This function therefore assumes that all bundles in targets
+// have the same rollout strategy.
 func getRollout(targets []*Target) *fleet.RolloutStrategy {
 	var rollout *fleet.RolloutStrategy
 	if len(targets) > 0 {
@@ -51,6 +57,10 @@ func manualPartition(rollout *fleet.RolloutStrategy, targets []*Target) ([]parti
 					continue targetLoop
 				}
 			}
+			if len(target.ClusterGroups) == 0 && matcher.Match(target.Cluster.Name, "", nil, target.Cluster.Labels) {
+				partitionTargets = append(partitionTargets, target)
+				continue targetLoop
+			}
 		}
 
 		partitions, err = appendPartition(partitions, partitionDef.Name, partitionTargets, partitionDef.MaxUnavailable, rollout.MaxUnavailable)
@@ -62,6 +72,14 @@ func manualPartition(rollout *fleet.RolloutStrategy, targets []*Target) ([]parti
 	return partitions, nil
 }
 
+// getAutoPartitionThreshold returns the minimum number of clusters required before auto-partitioning is enabled
+func getAutoPartitionThreshold(rollout *fleet.RolloutStrategy) int {
+	if rollout.AutoPartitionThreshold != nil {
+		return *rollout.AutoPartitionThreshold
+	}
+	return defAutoPartitionThreshold
+}
+
 // autoPartition computes a slice of Partition given some targets and rollout strategy (pure function)
 func autoPartition(rollout *fleet.RolloutStrategy, targets []*Target) ([]partition, error) {
 	// if auto is disabled
@@ -70,8 +88,11 @@ func autoPartition(rollout *fleet.RolloutStrategy, targets []*Target) ([]partiti
 		return appendPartition(nil, "All", targets, rollout.MaxUnavailable)
 	}
 
-	// Also disable if less than 200
-	if len(targets) < 200 {
+	// Also disable if less than AutoPartitionThreshold
+	autoPartitionThreshold := getAutoPartitionThreshold(rollout)
+	// If threshold is 0 or negative, disable auto-partitioning
+	// Otherwise, disable if target count is less than the threshold
+	if autoPartitionThreshold <= 0 || len(targets) < autoPartitionThreshold {
 		return appendPartition(nil, "All", targets, rollout.MaxUnavailable)
 	}
 
@@ -89,10 +110,7 @@ func autoPartition(rollout *fleet.RolloutStrategy, targets []*Target) ([]partiti
 		if len(targets) == 0 {
 			return partitions, nil
 		}
-		end := maxSize
-		if len(targets) < maxSize {
-			end = len(targets)
-		}
+		end := min(len(targets), maxSize)
 
 		partitionTargets := targets[:end]
 		name := fmt.Sprintf("Partition %d - %d", offset, offset+end)

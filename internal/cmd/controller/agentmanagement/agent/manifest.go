@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"path"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/rancher/fleet/internal/cmd"
 	"github.com/rancher/fleet/internal/config"
+	"github.com/rancher/fleet/internal/experimental"
 	"github.com/rancher/fleet/internal/names"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -44,6 +46,7 @@ type ManifestOptions struct {
 	BundleDeploymentWorkers string
 	DriftWorkers            string
 	cmd.LeaderElectionOptions
+	PriorityClassName string
 }
 
 // Manifest builds and returns a deployment manifest for the fleet-agent with a
@@ -165,6 +168,7 @@ func agentApp(namespace string, agentScope string, opts ManifestOptions) *appsv1
 					},
 				},
 				Spec: corev1.PodSpec{
+					PriorityClassName:  opts.PriorityClassName,
 					ServiceAccountName: serviceAccount,
 					Containers: []corev1.Container{
 						{
@@ -193,6 +197,7 @@ func agentApp(namespace string, agentScope string, opts ManifestOptions) *appsv1
 								{Name: "CATTLE_ELECTION_LEASE_DURATION", Value: opts.LeaseDuration.String()},
 								{Name: "CATTLE_ELECTION_RETRY_PERIOD", Value: opts.RetryPeriod.String()},
 								{Name: "CATTLE_ELECTION_RENEW_DEADLINE", Value: opts.RenewDeadline.String()},
+								{Name: "EXPERIMENTAL_COPY_RESOURCES_DOWNSTREAM", Value: fmt.Sprintf("%t", experimental.CopyResourcesDownstreamEnabled())},
 							},
 							Command: []string{
 								"fleetagent",
@@ -274,6 +279,11 @@ func agentApp(namespace string, agentScope string, opts ManifestOptions) *appsv1
 
 	// Set hostNetwork
 	app.Spec.Template.Spec.HostNetwork = opts.HostNetwork
+	if opts.HostNetwork {
+		app.Spec.Strategy = appsv1.DeploymentStrategy{
+			Type: appsv1.RecreateDeploymentStrategyType,
+		}
+	}
 
 	// overwrite affinity if present on cluster
 	if opts.AgentAffinity != nil {

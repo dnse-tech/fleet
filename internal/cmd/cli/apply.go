@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -20,13 +19,13 @@ import (
 	ssh "github.com/rancher/fleet/internal/ssh"
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/yaml"
-)
-
-const (
-	FleetApplyConflictRetriesEnv = "FLEET_APPLY_CONFLICT_RETRIES"
-	defaultApplyConflictRetries  = 1
+	"k8s.io/client-go/kubernetes"
+	typedv1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 )
 
 type readFile func(name string) ([]byte, error)
@@ -43,33 +42,31 @@ type Apply struct {
 	FleetClient
 	BundleInputArgs
 	OutputArgsNoDefault
-	Label                       map[string]string `usage:"Labels to apply to created bundles" short:"l"`
-	TargetsFile                 string            `usage:"Addition source of targets and restrictions to be append"`
-	Compress                    bool              `usage:"Force all resources to be compress" short:"c"`
-	ServiceAccount              string            `usage:"Service account to assign to bundle created" short:"a"`
-	SyncGeneration              int               `usage:"Generation number used to force sync the deployment"`
-	TargetNamespace             string            `usage:"Ensure this bundle goes to this target namespace"`
-	Paused                      bool              `usage:"Create bundles in a paused state"`
-	Commit                      string            `usage:"Commit to assign to the bundle" env:"COMMIT"`
-	Username                    string            `usage:"Basic auth username for helm repo" env:"HELM_USERNAME"`
-	PasswordFile                string            `usage:"Path of file containing basic auth password for helm repo"`
-	CACertsFile                 string            `usage:"Path of custom cacerts for helm repo" name:"cacerts-file"`
-	SSHPrivateKeyFile           string            `usage:"Path of ssh-private-key for helm repo" name:"ssh-privatekey-file"`
-	HelmRepoURLRegex            string            `usage:"Helm credentials will be used if the helm repo matches this regex. Credentials will always be used if this is empty or not provided" name:"helm-repo-url-regex"`
-	KeepResources               bool              `usage:"Keep resources created after the GitRepo or Bundle is deleted" name:"keep-resources"`
-	DeleteNamespace             bool              `usage:"Delete GitRepo target namespace after the GitRepo or Bundle is deleted" name:"delete-namespace"`
-	HelmCredentialsByPathFile   string            `usage:"Path of file containing helm credentials for paths" name:"helm-credentials-by-path-file"`
-	CorrectDrift                bool              `usage:"Rollback any change made from outside of Fleet" name:"correct-drift"`
-	CorrectDriftForce           bool              `usage:"Use --force when correcting drift. Resources can be deleted and recreated" name:"correct-drift-force"`
-	CorrectDriftKeepFailHistory bool              `usage:"Keep helm history for failed rollbacks" name:"correct-drift-keep-fail-history"`
-	OCIReference                string            `usage:"OCI registry reference" name:"oci-reference"`
-	OCIUsername                 string            `usage:"Basic auth username for OCI registry" env:"OCI_USERNAME"`
-	OCIPasswordFile             string            `usage:"Path of file containing basic auth password for OCI registry" name:"oci-password-file"`
-	OCIBasicHTTP                bool              `usage:"Use HTTP to access the OCI regustry" name:"oci-basic-http"`
-	OCIInsecure                 bool              `usage:"Allow connections to OCI registry without certs" name:"oci-insecure"`
-	OCIRegistrySecret           string            `usage:"OCI storage registry secret name" name:"oci-registry-secret"`
-	DrivenScan                  bool              `usage:"Use driven scan. Bundles are defined by the user" name:"driven-scan"`
-	DrivenScanSeparator         string            `usage:"Separator to use for bundle folder and options file" name:"driven-scan-sep" default:":"`
+	Label                        map[string]string `usage:"Labels to apply to created bundles" short:"l"`
+	TargetsFile                  string            `usage:"Addition source of targets and restrictions to be append"`
+	Compress                     bool              `usage:"Force all resources to be compressed" short:"c"`
+	ServiceAccount               string            `usage:"Service account to assign to bundle created" short:"a"`
+	SyncGeneration               int               `usage:"Generation number used to force sync the deployment"`
+	TargetNamespace              string            `usage:"Ensure this bundle goes to this target namespace"`
+	Paused                       bool              `usage:"Create bundles in a paused state"`
+	Commit                       string            `usage:"Commit to assign to the bundle" env:"COMMIT"`
+	Username                     string            `usage:"Basic auth username for helm repo" env:"HELM_USERNAME"`
+	PasswordFile                 string            `usage:"Path of file containing basic auth password for helm repo"`
+	CACertsFile                  string            `usage:"Path of custom cacerts for helm repo" name:"cacerts-file"`
+	SSHPrivateKeyFile            string            `usage:"Path of ssh-private-key for helm repo" name:"ssh-privatekey-file"`
+	HelmRepoURLRegex             string            `usage:"Helm credentials will be used if the helm repo matches this regex. Credentials will always be used if this is empty or not provided" name:"helm-repo-url-regex"`
+	KeepResources                bool              `usage:"Keep resources created after the GitRepo or Bundle is deleted" name:"keep-resources"`
+	DeleteNamespace              bool              `usage:"Delete GitRepo target namespace after the GitRepo or Bundle is deleted" name:"delete-namespace"`
+	HelmCredentialsByPathFile    string            `usage:"Path of file containing helm credentials for paths" name:"helm-credentials-by-path-file"`
+	HelmBasicHTTP                bool              `usage:"Uses plain HTTP connections when downloading from helm repositories" name:"helm-basic-http"`
+	HelmInsecureSkipTLS          bool              `usage:"Skip TLS verification when downloading from helm repositories" name:"helm-insecure-skip-tls"`
+	CorrectDrift                 bool              `usage:"Rollback any change made from outside of Fleet" name:"correct-drift"`
+	CorrectDriftForce            bool              `usage:"Use --force when correcting drift. Resources can be deleted and recreated" name:"correct-drift-force"`
+	CorrectDriftKeepFailHistory  bool              `usage:"Keep helm history for failed rollbacks" name:"correct-drift-keep-fail-history"`
+	OCIRegistrySecret            string            `usage:"OCI storage registry secret name" name:"oci-registry-secret"`
+	DrivenScan                   bool              `usage:"Use driven scan. Bundles are defined by the user" name:"driven-scan"`
+	DrivenScanSeparator          string            `usage:"Separator to use for bundle folder and options file" name:"driven-scan-sep" default:":"`
+	BundleCreationMaxConcurrency int               `usage:"Maximum number of concurrent bundle creation routines" name:"bundle-creation-max-concurrency" default:"4" env:"FLEET_BUNDLE_CREATION_MAX_CONCURRENCY"`
 }
 
 func (r *Apply) PersistentPre(_ *cobra.Command, _ []string) error {
@@ -84,9 +81,9 @@ func (a *Apply) Run(cmd *cobra.Command, args []string) error {
 	// Apply retries on conflict errors.
 	// We could have race conditions updating the Bundle in high load situations
 	var err error
-	retries, err := GetOnConflictRetries()
+	retries, err := apply.GetOnConflictRetries()
 	if err != nil {
-		logrus.Errorf("failed parsing env variable %s, using defaults, err: %v", FleetApplyConflictRetriesEnv, err)
+		logrus.Errorf("failed parsing env variable %s, using defaults, err: %v", apply.FleetApplyConflictRetriesEnv, err)
 	}
 	for range retries {
 		err = a.run(cmd, args)
@@ -112,25 +109,26 @@ func (a *Apply) run(cmd *cobra.Command, args []string) error {
 
 	name := ""
 	opts := apply.Options{
-		Namespace:                   a.Namespace,
-		BundleFile:                  a.BundleFile,
-		Output:                      writer.NewDefaultNone(a.Output),
-		Compress:                    a.Compress,
-		ServiceAccount:              a.ServiceAccount,
-		Labels:                      a.Label,
-		TargetsFile:                 a.TargetsFile,
-		TargetNamespace:             a.TargetNamespace,
-		Paused:                      a.Paused,
-		SyncGeneration:              int64(a.SyncGeneration),
-		HelmRepoURLRegex:            a.HelmRepoURLRegex,
-		KeepResources:               a.KeepResources,
-		DeleteNamespace:             a.DeleteNamespace,
-		CorrectDrift:                a.CorrectDrift,
-		CorrectDriftForce:           a.CorrectDriftForce,
-		CorrectDriftKeepFailHistory: a.CorrectDriftKeepFailHistory,
-		DrivenScan:                  a.DrivenScan,
-		DrivenScanSeparator:         a.DrivenScanSeparator,
-		OCIRegistrySecret:           a.OCIRegistrySecret,
+		Namespace:                    a.Namespace,
+		BundleFile:                   a.BundleFile,
+		Output:                       writer.NewDefaultNone(a.Output),
+		Compress:                     a.Compress,
+		ServiceAccount:               a.ServiceAccount,
+		Labels:                       a.Label,
+		TargetsFile:                  a.TargetsFile,
+		TargetNamespace:              a.TargetNamespace,
+		Paused:                       a.Paused,
+		SyncGeneration:               int64(a.SyncGeneration),
+		HelmRepoURLRegex:             a.HelmRepoURLRegex,
+		KeepResources:                a.KeepResources,
+		DeleteNamespace:              a.DeleteNamespace,
+		CorrectDrift:                 a.CorrectDrift,
+		CorrectDriftForce:            a.CorrectDriftForce,
+		CorrectDriftKeepFailHistory:  a.CorrectDriftKeepFailHistory,
+		DrivenScan:                   a.DrivenScan,
+		DrivenScanSeparator:          a.DrivenScanSeparator,
+		OCIRegistrySecret:            a.OCIRegistrySecret,
+		BundleCreationMaxConcurrency: a.BundleCreationMaxConcurrency,
 	}
 
 	knownHostsPath, err := writeTmpKnownHosts()
@@ -140,17 +138,18 @@ func (a *Apply) run(cmd *cobra.Command, args []string) error {
 
 	defer os.RemoveAll(knownHostsPath)
 
-	if err := a.addAuthToOpts(&opts, os.ReadFile); err != nil {
+	if err := a.addAuthToOpts(&opts, os.ReadFile, a.HelmBasicHTTP, a.HelmInsecureSkipTLS); err != nil {
 		return fmt.Errorf("adding auth to opts: %w", err)
 	}
 
-	if a.File == "-" {
+	switch {
+	case a.File == "-":
 		opts.BundleReader = os.Stdin
 		if len(args) != 1 {
 			return fmt.Errorf("the bundle name is required as the first argument")
 		}
 		name = args[0]
-	} else if a.File != "" {
+	case a.File != "":
 		f, err := os.Open(a.File)
 		if err != nil {
 			return err
@@ -161,9 +160,9 @@ func (a *Apply) run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("the bundle name is required as the first argument")
 		}
 		name = args[0]
-	} else if len(args) < 1 {
+	case len(args) < 1:
 		return fmt.Errorf("at least one arguments is required BUNDLE_NAME")
-	} else {
+	default:
 		name = args[0]
 		args = args[1:]
 	}
@@ -173,7 +172,7 @@ func (a *Apply) run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("setting git SSH command env var for known hosts: %w", err)
 	}
 
-	defer restoreEnv() // nolint: errcheck // best-effort
+	defer restoreEnv() //nolint: errcheck // best-effort
 
 	ctx := cmd.Context()
 	cfg := ctrl.GetConfigOrDie()
@@ -181,16 +180,22 @@ func (a *Apply) run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if opts.DrivenScan {
-		return apply.CreateBundlesDriven(ctx, client, name, args, opts)
+	recorder, err := getEventRecorder(cfg, "fleet-apply")
+	if err != nil {
+		return err
 	}
-	return apply.CreateBundles(ctx, client, name, args, opts)
+
+	if opts.DrivenScan {
+		return apply.CreateBundlesDriven(ctx, client, recorder, name, args, opts)
+	}
+	return apply.CreateBundles(ctx, client, recorder, name, args, opts)
 }
 
 // addAuthToOpts adds auth if provided as arguments. It will look first for HelmCredentialsByPathFile. If HelmCredentialsByPathFile
 // is not provided it means that the same helm secret should be used for all helm repositories, then it will look for
 // Username, PasswordFile, CACertsFile and SSHPrivateKeyFile.
-func (a *Apply) addAuthToOpts(opts *apply.Options, readFile readFile) error {
+// It will also set the values for using basic HTTP connections and skipping TLS.
+func (a *Apply) addAuthToOpts(opts *apply.Options, readFile readFile, helmBasicHTTP, helmInsecureSkipTLS bool) error {
 	if a.HelmCredentialsByPathFile != "" {
 		file, err := readFile(a.HelmCredentialsByPathFile)
 		if err != nil && !os.IsNotExist(err) {
@@ -230,11 +235,14 @@ func (a *Apply) addAuthToOpts(opts *apply.Options, readFile readFile) error {
 		opts.Auth.SSHPrivateKey = privateKey
 	}
 
+	opts.Auth.BasicHTTP = helmBasicHTTP
+	opts.Auth.InsecureSkipVerify = helmInsecureSkipTLS
+
 	return nil
 }
 
 func currentCommit() string {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := exec.Command("git", "rev-parse", "HEAD") //nolint:noctx // TODO: refactor to use go-git's ResolveRevision
 	buf := &bytes.Buffer{}
 	cmd.Stdout = buf
 	err := cmd.Run()
@@ -242,22 +250,6 @@ func currentCommit() string {
 		return strings.TrimSpace(buf.String())
 	}
 	return ""
-}
-
-func GetOnConflictRetries() (int, error) {
-	s := os.Getenv(FleetApplyConflictRetriesEnv)
-	if s != "" {
-		// check if we have a valid value
-		// it must be an integer
-		r, err := strconv.Atoi(s)
-		if err != nil {
-			return defaultApplyConflictRetries, err
-		} else {
-			return r, nil
-		}
-	}
-
-	return defaultApplyConflictRetries, nil
 }
 
 // writeTmpKnownHosts creates a temporary file and writes known_hosts data to it, if such data is available from
@@ -346,4 +338,19 @@ func setEnv(knownHostsPath string) (func() error, error) {
 	}
 
 	return restore, nil
+}
+
+func getEventRecorder(config *rest.Config, componentName string) (record.EventRecorder, error) {
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartStructuredLogging(0)
+	broadcaster.StartRecordingToSink(&typedv1core.EventSinkImpl{
+		Interface: clientset.CoreV1().Events(""),
+	})
+
+	return broadcaster.NewRecorder(scheme, corev1.EventSource{Component: componentName}), nil
 }

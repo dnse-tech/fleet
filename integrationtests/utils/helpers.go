@@ -2,10 +2,14 @@ package utils
 
 import (
 	"context"
+	"os"
+	"strings"
 
 	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -47,7 +51,40 @@ func CreateCluster(ctx context.Context, k8sClient client.Client, name, controlle
 	if err != nil {
 		return nil, err
 	}
-	cluster.Status.Namespace = clusterNs
-	err = k8sClient.Status().Update(ctx, cluster)
+
+	ns := types.NamespacedName{
+		Namespace: controllerNs,
+		Name:      name,
+	}
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		c := &v1alpha1.Cluster{}
+		err := k8sClient.Get(ctx, ns, c)
+		if err != nil {
+			return err
+		}
+		c.Status.Namespace = clusterNs
+		return k8sClient.Status().Update(ctx, c)
+	})
 	return cluster, err
+}
+
+// ExtractResourceLogs extracts log lines related to a specific resource name
+func ExtractResourceLogs(allLogs, resourceName string) string {
+	var resourceLogs []string
+	for _, line := range strings.Split(allLogs, "\n") {
+		if strings.Contains(line, resourceName) {
+			resourceLogs = append(resourceLogs, line)
+		}
+	}
+	return strings.Join(resourceLogs, "\n")
+}
+
+// DisableReaper disables the testcontainers reaper (Ryuk) to avoid issues
+// with Docker container state in local development environments.
+// The reaper is mainly useful in CI but often causes race conditions locally.
+// This should be called in init() functions of test packages that use testcontainers.
+func DisableReaper() {
+	if os.Getenv("TESTCONTAINERS_RYUK_DISABLED") == "" {
+		os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	}
 }

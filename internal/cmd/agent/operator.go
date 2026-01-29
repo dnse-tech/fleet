@@ -19,7 +19,7 @@ import (
 	"github.com/rancher/fleet/internal/manifest"
 	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 
-	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v4/pkg/cli"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -343,10 +343,6 @@ func getAgentConfig(ctx context.Context, namespace string, cfg *rest.Config) (ag
 	agentConfig, err = config.ReadConfig(configMap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config from ConfigMap: %w", err)
-	}
-
-	if agentConfig.AgentTLSMode == config.AgentTLSModeStrict {
-		config.BypassSystemCAStore()
 	}
 
 	return agentConfig, nil

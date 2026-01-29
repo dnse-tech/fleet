@@ -20,7 +20,7 @@ env:
   GOARCH: amd64
   CGO_ENABLED: 0
   SETUP_K3D_VERSION: 'v5.8.3'
-  SETUP_K3S_VERSION: 'v1.33.1-k3s1'
+  SETUP_K3S_VERSION: 'v1.34.1-k3s1'
 
 jobs:
   rancher-fleet-integration:
@@ -28,12 +28,12 @@ jobs:
 
     steps:
       -
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.ref }}
       -
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version-file: 'go.mod'
           check-latest: true
@@ -43,17 +43,11 @@ jobs:
       -
         name: Determine cache key
         id: cache-key
-        run: |
-          DAY_OF_YEAR=$(date +%j)
-          if [ $(($DAY_OF_YEAR % 28)) -eq 0 ]; then
-            echo "value=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-          else
-            echo "value=latest" >> $GITHUB_OUTPUT
-          fi
+        run: ./.github/scripts/determine-cache-key.sh
       -
         name: Cache crust-gather CLI
         id: cache-crust
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
         with:
           path: ~/.local/bin/crust-gather
           key: ${{ runner.os }}-crust-gather-${{ steps.cache-key.outputs.value }}
@@ -67,7 +61,9 @@ jobs:
             mkdir -p ~/.local/bin
             if curl -sSfL https://github.com/crust-gather/crust-gather/raw/main/install.sh | sh -s -- --yes; then
               # Cache the binary for future runs
-              which crust-gather && cp $(which crust-gather) ~/.local/bin/
+              if [ ! -f ~/.local/bin/crust-gather ]; then
+                which crust-gather && cp $(which crust-gather) ~/.local/bin/
+              fi
             else
               echo "Failed to download crust-gather"
               exit 1
@@ -78,7 +74,7 @@ jobs:
             sudo ln -sf ~/.local/bin/crust-gather /usr/local/bin/
           fi
       -
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
         id: rancher-cli-cache
         with:
           path: /home/runner/.local/bin
@@ -98,17 +94,17 @@ jobs:
           ./.github/scripts/build-fleet-binaries.sh
       -
         name: Set up QEMU
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       -
         name: Get uuid
         id: uuid
         run: echo "::set-output name=uuid::$(uuidgen)"
       -
         id: meta-fleet
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ttl.sh/rancher/fleet-${{ steps.uuid.outputs.uuid }}
@@ -125,7 +121,7 @@ jobs:
           labels: ${{ steps.meta-fleet.outputs.labels }}
       -
         id: meta-fleet-agent
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ttl.sh/rancher/fleet-agent-${{ steps.uuid.outputs.uuid }}
@@ -207,7 +203,7 @@ jobs:
           crust-gather collect --exclude-namespace=kube-system --exclude-kind=Lease --duration=5s -f tmp/downstream
       -
         name: Upload logs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: failure()
         with:
           name: gha-fleet-rancher-logs-${{ github.sha }}-${{ github.run_id }}

@@ -2,12 +2,14 @@ package deployer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
 
 	"github.com/rancher/fleet/internal/bundlereader"
+	"github.com/rancher/fleet/internal/cmd/controller/summary"
 	"github.com/rancher/fleet/internal/helmdeployer"
 	"github.com/rancher/fleet/internal/manifest"
 	"github.com/rancher/fleet/internal/ocistorage"
@@ -23,6 +25,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+type NotReadyDependenciesError struct {
+	Pending []string
+}
+
+func (e *NotReadyDependenciesError) Error() string {
+	return fmt.Sprintf("dependent bundle(s) are not ready: %v", e.Pending)
+}
 
 type Deployer struct {
 	client         client.Client
@@ -54,7 +64,13 @@ func (d *Deployer) RemoveExternalChanges(ctx context.Context, bd *fleet.BundleDe
 
 // DeployBundle deploys the bundle deployment with the helm SDK. It does not
 // mutate bd, instead it returns the modified status
-func (d *Deployer) DeployBundle(ctx context.Context, bd *fleet.BundleDeployment) (fleet.BundleDeploymentStatus, error) {
+// If force is true, bd will be upgraded even if its contents have not changed; this is useful for
+// applying changes coming from external resources, such as those referenced through valuesFrom.
+func (d *Deployer) DeployBundle(
+	ctx context.Context,
+	bd *fleet.BundleDeployment,
+	force bool,
+) (fleet.BundleDeploymentStatus, error) {
 	status := bd.Status
 	logger := log.FromContext(ctx).WithName("deploy-bundle").WithValues("deploymentID", bd.Spec.DeploymentID, "appliedDeploymentID", status.AppliedDeploymentID)
 
@@ -63,7 +79,7 @@ func (d *Deployer) DeployBundle(ctx context.Context, bd *fleet.BundleDeployment)
 		return status, err
 	}
 
-	releaseID, err := d.helmdeploy(ctx, logger, bd)
+	releaseID, err := d.helmdeploy(ctx, logger, bd, force)
 
 	if err != nil {
 		// When an error from DeployBundle is returned it causes DeployBundle
@@ -99,8 +115,10 @@ func (d *Deployer) DeployBundle(ctx context.Context, bd *fleet.BundleDeployment)
 
 // Deploy the bundle deployment, i.e. with helmdeployer.
 // This loads the manifest and the contents from the upstream cluster.
-func (d *Deployer) helmdeploy(ctx context.Context, logger logr.Logger, bd *fleet.BundleDeployment) (string, error) {
-	if bd.Spec.DeploymentID == bd.Status.AppliedDeploymentID {
+// If force is true, checks on whether the bundle deployment exists will be skipped, leading to the bundle deployment
+// being updated even if its deployment ID has not changed.
+func (d *Deployer) helmdeploy(ctx context.Context, logger logr.Logger, bd *fleet.BundleDeployment, force bool) (string, error) {
+	if !force && bd.Spec.DeploymentID == bd.Status.AppliedDeploymentID {
 		if ok, err := d.helm.EnsureInstalled(bd.Name, bd.Status.Release); err != nil {
 			return "", err
 		} else if ok {
@@ -112,9 +130,10 @@ func (d *Deployer) helmdeploy(ctx context.Context, logger logr.Logger, bd *fleet
 		m   *manifest.Manifest
 		err error
 	)
-	if bd.Spec.OCIContents {
+	switch {
+	case bd.Spec.OCIContents:
 		oci := ocistorage.NewOCIWrapper()
-		secretID := types.NamespacedName{Name: manifestID, Namespace: bd.Namespace}
+		secretID := client.ObjectKey{Name: manifestID, Namespace: bd.Namespace}
 		opts, err := ocistorage.ReadOptsFromSecret(ctx, d.upstreamClient, secretID)
 		if err != nil {
 			return "", err
@@ -133,12 +152,12 @@ func (d *Deployer) helmdeploy(ctx context.Context, logger logr.Logger, bd *fleet
 		if actualID != manifestID {
 			return "", fmt.Errorf("invalid or corrupt manifest. Expecting id: %q, got %q", manifestID, actualID)
 		}
-	} else if bd.Spec.HelmChartOptions != nil {
-		m, err = bundlereader.GetManifestFromHelmChart(ctx, d.client, bd)
+	case bd.Spec.HelmChartOptions != nil:
+		m, err = bundlereader.GetManifestFromHelmChart(ctx, d.upstreamClient, bd)
 		if err != nil {
 			return "", err
 		}
-	} else {
+	default:
 		m, err = d.lookup.Get(ctx, d.upstreamClient, manifestID)
 		if err != nil {
 			return "", err
@@ -291,7 +310,7 @@ func deployErrToStatus(err error, status fleet.BundleDeploymentStatus) (bool, fl
 
 	// The case that the bundle is already in an error state. A previous
 	// condition with the error should already be applied.
-	if err == helmdeployer.ErrNoResourceID {
+	if errors.Is(err, helmdeployer.ErrNoResourceID) {
 		return true, status
 	}
 
@@ -331,19 +350,38 @@ func (d *Deployer) checkDependency(ctx context.Context, bd *fleet.BundleDeployme
 			}
 
 			for _, depBundle := range bds.Items {
-				c := condition.Cond("Ready")
-				if c.IsTrue(depBundle) {
-					continue
-				} else {
+				if !isDependencyReady(depBundle, depend.AcceptedStates) {
 					depBundleList = append(depBundleList, depBundle.Name)
 				}
+
 			}
 		}
 	}
 
 	if len(depBundleList) != 0 {
-		return fmt.Errorf("dependent bundle(s) are not ready: %v", depBundleList)
+		return &NotReadyDependenciesError{Pending: depBundleList}
 	}
 
 	return nil
+}
+
+// isStateAccepted checks if currentState is in acceptedStates.
+// If acceptedStates is empty or nil, only Ready is accepted (default behavior).
+func isStateAccepted(currentState fleet.BundleState, acceptedStates []fleet.BundleState) bool {
+	if len(acceptedStates) == 0 {
+		return currentState == fleet.Ready
+	}
+	for _, s := range acceptedStates {
+		if currentState == s {
+			return true
+		}
+	}
+	return false
+}
+
+// isDependencyReady checks if a BundleDeployment dependency is in an acceptable state.
+// acceptedStates is a list of states that are considered acceptable for this dependency.
+// If acceptedStates is empty or nil, only the "Ready" state is accepted (default behavior).
+func isDependencyReady(depBundle fleet.BundleDeployment, acceptedStates []fleet.BundleState) bool {
+	return isStateAccepted(summary.GetDeploymentState(&depBundle), acceptedStates)
 }

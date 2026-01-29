@@ -48,6 +48,20 @@ source dev/setup-multi-cluster
 ginkgo e2e/multi-cluster
 ```
 
+### Controlling test output verbosity
+
+Integration tests suppress verbose output by default to keep test results clean and readable. This includes:
+- Helm dependency update messages
+- Log output from test servers and containers
+- Debug information from test components
+
+To enable verbose output for debugging purposes, set the `VERBOSE` environment variable:
+
+```bash
+# Run with verbose output enabled
+VERBOSE=1 ./dev/run-integration-tests.sh
+```
+
 ### Testing changes incrementally
 
 To test changes incrementally, rebuild just one binary, update the image in k3d
@@ -175,6 +189,10 @@ export GIT_HTTP_PASSWORD="foo"
 # needed for OCI tests, which are part of the single-cluster tests
 export CI_OCI_USERNAME="fleet-ci"
 export CI_OCI_PASSWORD="foo"
+export CI_OCI_READER_USERNAME="fleet-ci-reader"
+export CI_OCI_READER_PASSWORD="foo-reader"
+export CI_OCI_NO_DELETER_USERNAME=fleet-ci-no-deleter
+export CI_OCI_NO_DELETER_PASSWORD=foo-no-deleter
 export CI_OCI_CERTS_DIR="../../FleetCI-RootCA"
 ```
 
@@ -233,6 +251,28 @@ Therefore the infra setup doesn't work with the `public_hostname` config variabl
 This is not a problem, unless k3d is running in a VM and not directly on the host.
 
 It is possible to override the loadbalancer IP by setting the `external_ip` environment variable.
+
+## Setting up a local Docker Registry Mirror
+
+A pull-through cache for Docker Hub speeds up image pulls during repeated k3d cluster creation:
+
+```bash
+docker run -d \
+  --restart=always \
+  --name registry-cache \
+  --network fleet \
+  -p 5000:5000 \
+  -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io \
+  registry:2
+```
+
+To use it, set `export docker_mirror=http://registry-cache:5000` in your `.envrc` or before running k3d scripts.
+
+> **__NOTE:__** The registry persists across reboots due to `--restart=always`. To remove it run:
+
+```bash
+docker rm -f registry-cache
+```
 
 ## Running Github Actions locally
 
@@ -306,7 +346,7 @@ RUN wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${BUI
         && chmod +x /usr/bin/yq
 
 RUN curl -fsSL -o get_helm.sh \
-            https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && \
+            https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 && \
         chmod 700 get_helm.sh && \
         ./get_helm.sh
 

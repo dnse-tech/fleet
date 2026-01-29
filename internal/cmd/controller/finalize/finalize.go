@@ -6,15 +6,11 @@ import (
 	"strings"
 
 	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
-	"github.com/rancher/wrangler/v3/pkg/kv"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -22,6 +18,8 @@ const (
 	GitRepoFinalizer          = "fleet.cattle.io/gitrepo-finalizer"
 	BundleFinalizer           = "fleet.cattle.io/bundle-finalizer"
 	BundleDeploymentFinalizer = "fleet.cattle.io/bundle-deployment-finalizer"
+	ClusterFinalizer          = "fleet.cattle.io/cluster-finalizer"
+	ScheduleFinalizer         = "fleet.cattle.io/schedule-finalizer"
 )
 
 // PurgeBundles deletes all bundles related to the given resource namespaced name
@@ -64,64 +62,6 @@ func PurgeBundles(ctx context.Context, c client.Client, gitrepo types.Namespaced
 	return nil
 }
 
-// PurgeContent tries to delete the content resource related with the given bundle deployment.
-func PurgeContent(ctx context.Context, c client.Client, name, deplID string) error {
-	contentID, _ := kv.Split(deplID, ":")
-	content := &v1alpha1.Content{}
-	if err := c.Get(ctx, types.NamespacedName{Name: contentID}, content); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-
-	logger := log.FromContext(ctx).WithName("purge-content").WithValues("contentID", contentID, "finalizerName", name)
-
-	nn := types.NamespacedName{Name: content.Name}
-	if controllerutil.ContainsFinalizer(content, name) {
-		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			if err := c.Get(ctx, nn, content); err != nil {
-				return err
-			}
-
-			controllerutil.RemoveFinalizer(content, name)
-
-			return c.Update(ctx, content)
-		})
-		if err != nil {
-			return err
-		}
-
-		logger.V(1).Info("Removed finalizer from content resource")
-	}
-
-	if len(content.Finalizers) == 0 {
-		if err := c.Delete(ctx, content); err != nil {
-			return err
-		}
-		logger.V(1).Info("Deleted content resource")
-	}
-
-	return nil
-}
-
-// PurgeImageScans deletes all ImageScan resources related with the given GitRepo namespaces name.
-func PurgeImageScans(ctx context.Context, c client.Client, gitrepo types.NamespacedName) error {
-	images := &v1alpha1.ImageScanList{}
-	err := c.List(ctx, images, client.InNamespace(gitrepo.Namespace))
-	if err != nil {
-		return err
-	}
-
-	for _, image := range images.Items {
-		if image.Spec.GitRepoName == gitrepo.Name {
-			err := c.Delete(ctx, &image)
-			if err != nil {
-				return err
-			}
-		}
-
-	}
-	return nil
-}
-
 // PurgeNamespace deletes the given namespace if deleteNamespace is set to true.
 // It ignores the following namespaces, that are considered as default by fleet or kubernetes:
 // fleet-local, cattle-fleet-system, fleet-default, cattle-fleet-clusters-system, default
@@ -155,4 +95,25 @@ func PurgeNamespace(ctx context.Context, c client.Client, deleteNamespace bool, 
 	}
 
 	return nil
+}
+
+// EnsureFinalizer adds a finalizer to the given object if it doesn't exist.
+func EnsureFinalizer(ctx context.Context, c client.Client, obj client.Object, finalizer string) error {
+	if controllerutil.ContainsFinalizer(obj, finalizer) {
+		return nil
+	}
+
+	controllerutil.AddFinalizer(obj, finalizer)
+	return c.Update(ctx, obj)
+}
+
+func PurgeTargetNamespaceIfNeeded(ctx context.Context, c client.Client, gitrepo *v1alpha1.GitRepo) error {
+	deleteNamespace := gitrepo.Spec.DeleteNamespace
+	namespace := gitrepo.Spec.TargetNamespace
+
+	if gitrepo.Spec.KeepResources {
+		deleteNamespace = false
+	}
+
+	return PurgeNamespace(ctx, c, deleteNamespace, namespace)
 }

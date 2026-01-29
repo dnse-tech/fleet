@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/rancher/fleet/internal/cmd/controller/imagescan/update"
+	fleetgithub "github.com/rancher/fleet/internal/github"
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/durations"
 
@@ -206,7 +207,7 @@ func (j *GitCommitJob) cloneAndReplace(ctx context.Context) {
 		}
 	}
 
-	commit, err := commitAllAndPush(context.Background(), repo, auth, *gitrepo.Spec.ImageScanCommit)
+	commit, err := commitAllAndPush(ctx, repo, auth, *gitrepo.Spec.ImageScanCommit)
 	if err != nil {
 		err = j.updateErrorStatus(ctx, gitrepo, err)
 		logger.V(1).Info("Cannot commit and push to repo", "error", err)
@@ -303,8 +304,13 @@ func readAuth(ctx context.Context, logger logr.Logger, c client.Client, gitrepo 
 			return nil, err
 		}
 		return publicKey, nil
+	default:
+		auth, err := fleetgithub.GetGithubAppAuthFromSecret(secret, fleetgithub.DefaultAppAuthGetter{})
+		if err != nil {
+			return nil, err
+		}
+		return auth, nil
 	}
-	return nil, errors.New("invalid secret type")
 }
 
 func setupKnownHosts(gitrepo *fleet.GitRepo, data []byte) error {

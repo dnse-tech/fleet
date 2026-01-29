@@ -3,6 +3,7 @@ package apply
 import (
 	"crypto/subtle"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,7 +49,11 @@ func (r *repository) startRepository(authEnabled bool) {
 }
 
 func getHandler(authEnabled bool) http.Handler {
-	fs := http.FileServer(http.Dir(cli.AssetsPath + "helmrepository"))
+	dir := filepath.Join(cli.AssetsPath, "helmrepository")
+	if absDir, err := filepath.Abs(dir); err == nil {
+		dir = absDir
+	}
+	fs := http.FileServer(http.Dir(dir))
 	if !authEnabled {
 		return fs
 	}
@@ -67,7 +72,7 @@ type authHandler struct {
 func (h *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	user, pass, ok := r.BasicAuth()
 	if !ok || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(user)), []byte(username)) != 1 || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(pass)), []byte(password)) != 1 {
-		w.WriteHeader(401)
+		w.WriteHeader(http.StatusUnauthorized)
 		_, err := w.Write([]byte("Unauthorised."))
 		if err != nil {
 			return

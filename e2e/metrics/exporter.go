@@ -1,12 +1,14 @@
 package metrics
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 )
 
 type ExporterTest struct {
@@ -22,7 +24,12 @@ func NewExporterTest(url string) ExporterTest {
 // Get fetches the metrics from the Prometheus endpoint and returns them
 // as a map of metric families.
 func (et *ExporterTest) Get() (map[string]*dto.MetricFamily, error) {
-	resp, err := http.Get(et.url)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, et.url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -32,7 +39,7 @@ func (et *ExporterTest) Get() (map[string]*dto.MetricFamily, error) {
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	var parser expfmt.TextParser
+	parser := expfmt.NewTextParser(model.LegacyValidation)
 	metrics, err := parser.TextToMetricFamilies(resp.Body)
 	if err != nil {
 		return nil, err
@@ -86,6 +93,46 @@ func (m *ExporterTest) FindOneMetric(
 	}
 
 	return &Metric{Metric: metrics[0]}, nil
+}
+
+func (m *ExporterTest) MetricDoesNotExist(
+	allMetrics map[string]*dto.MetricFamily,
+	name string,
+	labels map[string]string,
+) error {
+	mf, ok := allMetrics[name]
+	if !ok {
+		return nil // If the metric family does not exist, we consider it as not found.
+	}
+
+	// If the metric family exists, we need to check if any of its metrics match the labels.
+	var metrics []*dto.Metric
+	for _, metric := range mf.Metric {
+		m := Metric{Metric: metric}
+
+		// Check that all labels match, if present.
+		match := true
+		for k, v := range labels {
+			if m.LabelValue(k) != v {
+				match = false
+				break
+			}
+		}
+		if match {
+			metrics = append(metrics, metric)
+		}
+	}
+
+	if len(metrics) > 0 {
+		return fmt.Errorf(
+			"expected to find 0 metrics for %s{%s}, got %d",
+			name,
+			promLabels(labels),
+			len(metrics),
+		)
+	}
+
+	return nil
 }
 
 type promLabels map[string]string

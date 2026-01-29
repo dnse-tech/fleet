@@ -2,24 +2,33 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rancher/fleet/internal/cmd/agent/deployer"
 	"github.com/rancher/fleet/internal/cmd/agent/deployer/cleanup"
 	"github.com/rancher/fleet/internal/cmd/agent/deployer/driftdetect"
 	"github.com/rancher/fleet/internal/cmd/agent/deployer/monitor"
+	"github.com/rancher/fleet/internal/experimental"
 	"github.com/rancher/fleet/internal/helmvalues"
+	"github.com/rancher/fleet/internal/namespaces"
 	fleetv1 "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"github.com/rancher/fleet/pkg/durations"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	errutil "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -77,7 +86,8 @@ func (r *BundleDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 						if n == nil || o == nil {
 							return false
 						}
-						return n.Status.SyncGeneration != o.Status.SyncGeneration
+						return n.Status.SyncGeneration != o.Status.SyncGeneration ||
+							(o.Spec.DownstreamResourcesGeneration != n.Spec.DownstreamResourcesGeneration)
 					},
 					DeleteFunc: func(e event.DeleteEvent) bool {
 						return true
@@ -99,6 +109,8 @@ func (r *BundleDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
+//
+//nolint:gocyclo // refactoring this would make it harder to understand
 func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName("bundledeployment")
 	ctx = log.IntoContext(ctx, logger)
@@ -110,10 +122,10 @@ func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if apierrors.IsNotFound(err) {
 		// This actually deletes the helm releases if a bundledeployment is deleted or orphaned
 		logger.V(1).Info("BundleDeployment deleted, cleaning up helm releases")
-		err := r.Cleanup.CleanupReleases(ctx, key, nil)
-		if err != nil {
+		if err := r.Cleanup.CleanupReleases(ctx, key, nil); err != nil {
 			logger.Error(err, "Failed to clean up missing bundledeployment", "key", key)
 		}
+
 		return ctrl.Result{}, nil
 	} else if err != nil {
 		return ctrl.Result{}, err
@@ -122,6 +134,12 @@ func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	if bd.Spec.Paused {
 		logger.V(1).Info("Bundle paused, clearing drift detection")
+		err := r.DriftDetect.Clear(req.String())
+
+		return ctrl.Result{}, err
+	}
+	if bd.Spec.OffSchedule {
+		logger.V(1).Info("Bundle not in schedule, clearing drift detection")
 		err := r.DriftDetect.Clear(req.String())
 
 		return ctrl.Result{}, err
@@ -144,15 +162,30 @@ func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
+	forceDeploy, err := r.copyResourcesFromUpstream(ctx, bd, logger)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	var merr []error
 
 	// helm deploy the bundledeployment
-	if status, err := r.Deployer.DeployBundle(ctx, bd); err != nil {
-		logger.V(1).Info("Failed to deploy bundle", "status", status, "error", err)
-
+	if status, err := r.Deployer.DeployBundle(ctx, bd, forceDeploy); err != nil {
 		// do not use the returned status, instead set the condition and possibly a timestamp
 		bd.Status = setCondition(bd.Status, err, monitor.Cond(fleetv1.BundleDeploymentConditionDeployed))
 
+		// Not-ready dependencies should not be treated as an error.
+		// Instead, a controlled requeue should happen until the conditions are met.
+		var notReadyDependenciesError *deployer.NotReadyDependenciesError
+		if errors.As(err, &notReadyDependenciesError) {
+			if err := r.updateStatus(ctx, orig, bd); err != nil {
+				return ctrl.Result{}, err
+			}
+			logger.V(1).Info("Dependencies not ready, requeuing...", "pending", notReadyDependenciesError.Pending)
+			return ctrl.Result{RequeueAfter: durations.WaitForDependenciesReadyRequeueInterval}, nil
+		}
+
+		logger.V(1).Info("Failed to deploy bundle", "status", status, "error", err)
 		merr = append(merr, fmt.Errorf("failed deploying bundle: %w", err))
 	} else {
 		logger.V(1).Info("Bundle deployed", "status", status)
@@ -199,6 +232,40 @@ func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		merr = append(merr, fmt.Errorf("failed refreshing drift detection: %w", err))
 	}
 
+	// Check if this bundle deployment has overlapping resources with a previously deleted bundle (Overwrites
+	// field): if so, requeue to ensure the corresponding Helm release, and therefore its resources, are
+	// reinstalled.
+	// Overlaps are checked by namespace, kind and name. Resource contents do not matter in this context, as a
+	// resource would be deleted by Helm deleting its parent release based on its kind, name and namespace.
+	// This requires deleting the release beforehand, to force a new installation as the deployer would otherwise
+	// skip re-installing an existing release with no version change.
+	// See fleet#3770 for more context.
+	if len(orig.Status.ModifiedStatus) > 0 && len(orig.Spec.Options.Overwrites) > 0 {
+		for _, ms := range orig.Status.ModifiedStatus {
+			if !ms.Create { // missing
+				continue
+			}
+			for _, ow := range orig.Spec.Options.Overwrites {
+				if ow.Kind == ms.Kind && ow.Name == ms.Name {
+					logger.V(1).Info(
+						"Triggering new deployment to overwrite missing resource",
+						"kind", ow.Kind,
+						"name", ow.Name,
+						"namespace", ow.Namespace,
+					)
+
+					// Uninstall the release to allow a new reconcile loop to re-install it,
+					// resolving the missing resource(s) issue.
+					if err := r.Cleanup.CleanupReleases(ctx, key, nil); err != nil {
+						logger.V(1).Info("Failed to clean up releases before triggering new deployment", "error", err)
+					}
+
+					return ctrl.Result{RequeueAfter: durations.DefaultRequeueAfter}, nil
+				}
+			}
+		}
+	}
+
 	if err := r.Cleanup.CleanupReleases(ctx, key, bd); err != nil {
 		logger.V(1).Info("Failed to clean up bundledeployment releases", "error", err)
 	}
@@ -212,6 +279,167 @@ func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	return ctrl.Result{}, errutil.NewAggregate(merr)
+}
+
+// copyResourcesFromUpstream copies bd's DownstreamResources, from the downstream cluster's namespace on the management
+// cluster to the destination namespace on the downstream cluster, creating that namespace if needed.
+// If bd does not have any DownstreamResources, this method does not issue any API server calls.
+func (r *BundleDeploymentReconciler) copyResourcesFromUpstream(
+	ctx context.Context,
+	bd *fleetv1.BundleDeployment,
+	logger logr.Logger,
+) (bool, error) {
+	if !experimental.CopyResourcesDownstreamEnabled() {
+		return false, nil
+	}
+
+	if len(bd.Spec.Options.DownstreamResources) == 0 {
+		return false, nil
+	}
+
+	destNS := namespaces.GetDeploymentNS(r.DefaultNamespace, bd.Spec.Options)
+
+	ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: destNS}}
+	if err := r.LocalClient.Get(ctx, types.NamespacedName{Name: ns.Name}, &ns); apierrors.IsNotFound(err) {
+		if err := r.LocalClient.Create(ctx, &ns); err != nil {
+			logger.Info(err.Error())
+			return false, err
+		}
+
+		logger.V(1).Info("Created namespace to copy resources from upstream", "namespace", ns.Name)
+	}
+
+	requiresBDUpdate := false
+
+	for _, rsc := range bd.Spec.Options.DownstreamResources {
+		var updated bool
+		var err error
+
+		switch strings.ToLower(rsc.Kind) {
+		case "secret":
+			updated, err = r.copySecret(ctx, bd, rsc.Name, destNS)
+		case "configmap":
+			updated, err = r.copyConfigMap(ctx, bd, rsc.Name, destNS)
+		default:
+			return false, fmt.Errorf("unknown resource type for copy to downstream cluster: %q", rsc.Kind)
+		}
+
+		if err != nil {
+			return false, err
+		}
+
+		if updated {
+			requiresBDUpdate = true
+		}
+	}
+
+	// update DownstreamResourcesGeneration to reflect that resources were copied/updated
+	bd.Status.DownstreamResourcesGeneration = bd.Spec.DownstreamResourcesGeneration
+
+	return requiresBDUpdate, nil
+}
+
+// copySecret copies a secret from the bundle deployment's namespace to the destination namespace
+func (r *BundleDeploymentReconciler) copySecret(
+	ctx context.Context,
+	bd *fleetv1.BundleDeployment,
+	name string,
+	destNS string,
+) (bool, error) {
+	var source corev1.Secret
+	if err := r.Reader.Get(ctx, client.ObjectKey{Namespace: bd.Namespace, Name: name}, &source); err != nil {
+		// The bundle deployment is actually created by the bundle reconciler _before_
+		// these objects are copied to the cluster's namespace, hence retries should happen if
+		// they are not found.
+		return false, fmt.Errorf(
+			"could not get secret %s/%s from upstream namespace for copying: %w",
+			bd.Namespace,
+			name,
+			err,
+		)
+	}
+
+	// Create a new Secret for the destination namespace
+	// We're not doing a DeepCopy here to avoid copying ResourceVersion and other metadata
+	// When using a single cluster environment, the downstream cluster is the same
+	// as the management cluster, and copying ResourceVersion or any other metadata would cause conflicts.
+	s := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: destNS,
+		},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.LocalClient, &s, func() error {
+		s.Type = source.Type // important for e.g. image pull secrets
+		s.Labels = source.Labels
+		s.Annotations = source.Annotations
+		s.Data = source.Data
+		s.StringData = source.StringData
+		// Ensure ownership label is preserved
+		if s.Labels == nil {
+			s.Labels = map[string]string{}
+		}
+		s.Labels[fleetv1.BundleDeploymentOwnershipLabel] = bd.Name
+
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to create or update secret %s/%s downstream: %w", bd.Namespace, name, err)
+	}
+
+	return op == controllerutil.OperationResultUpdated, nil
+}
+
+// copyConfigMap copies a configmap from the bundle deployment's namespace to the destination namespace
+func (r *BundleDeploymentReconciler) copyConfigMap(
+	ctx context.Context,
+	bd *fleetv1.BundleDeployment,
+	name string,
+	destNS string,
+) (bool, error) {
+	var source corev1.ConfigMap
+	if err := r.Reader.Get(ctx, client.ObjectKey{Namespace: bd.Namespace, Name: name}, &source); err != nil {
+		// The bundle deployment is actually created by the bundle reconciler _before_
+		// these objects are copied to the cluster's namespace, hence retries should happen if
+		// they are not found.
+		return false, fmt.Errorf(
+			"could not get config map %s/%s from upstream namespace for copying: %w",
+			bd.Namespace,
+			name,
+			err,
+		)
+	}
+
+	// Create a new ConfigMap for the destination namespace
+	// We're not doing a DeepCopy here to avoid copying ResourceVersion and other metadata
+	// When using a single cluster environment, the downstream cluster is the same
+	// as the management cluster, and copying ResourceVersion or any other metadata would cause conflicts.
+	cm := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: destNS,
+		},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.LocalClient, &cm, func() error {
+		cm.Labels = source.Labels
+		cm.Annotations = source.Annotations
+		cm.Data = source.Data
+		cm.BinaryData = source.BinaryData
+		// Ensure ownership label is preserved
+		if cm.Labels == nil {
+			cm.Labels = map[string]string{}
+		}
+		cm.Labels[fleetv1.BundleDeploymentOwnershipLabel] = bd.Name
+
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to create or update configmap %s/%s downstream: %w", bd.Namespace, name, err)
+	}
+
+	return op == controllerutil.OperationResultUpdated, nil
 }
 
 func (r *BundleDeploymentReconciler) updateStatus(ctx context.Context, orig *fleetv1.BundleDeployment, obj *fleetv1.BundleDeployment) error {

@@ -9,6 +9,7 @@ import (
 
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -79,11 +80,7 @@ func (c *CollectorCollection) Collect(ctx context.Context, obj metav1.ObjectMeta
 	logger := log.FromContext(ctx).WithName("metrics")
 	defer func() {
 		if r := recover(); r != nil {
-			msg, ok := r.(string)
-			if !ok {
-				msg = "unexpected error"
-			}
-			logger.Error(errors.New("error collecting metrics"), msg, r)
+			logger.Error(errors.New("error collecting metrics"), "observed panic", "panic", r)
 		}
 	}()
 	c.Delete(obj.GetObjectMeta().GetName(), obj.GetObjectMeta().GetNamespace())
@@ -250,6 +247,10 @@ func (m *ObjCounterVec) Inc(obj metav1.Object) {
 	m.counterVec.WithLabelValues(obj.GetName(), obj.GetNamespace()).Inc()
 }
 
+func (m *ObjCounterVec) DeleteByReq(req ctrl.Request) bool {
+	return m.counterVec.DeleteLabelValues(req.Name, req.Namespace)
+}
+
 var BucketsLatency = []float64{.1, .2, .5, 1, 2, 5, 10, 30}
 
 func ObjHistogram(name, help string, buckets []float64) (h ObjHistogramVec) {
@@ -280,6 +281,10 @@ func (m *ObjHistogramVec) Observe(obj metav1.Object, value float64) {
 	m.histogram.WithLabelValues(obj.GetName(), obj.GetNamespace()).Observe(value)
 }
 
+func (m *ObjHistogramVec) DeleteByReq(req ctrl.Request) bool {
+	return m.histogram.DeleteLabelValues(req.Name, req.Namespace)
+}
+
 func ObjGauge(name, help string) (g ObjGaugeVec) {
 	gauge := promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -305,4 +310,8 @@ type ObjGaugeVec struct {
 
 func (m *ObjGaugeVec) Set(obj metav1.Object, value float64) {
 	m.gauge.WithLabelValues(obj.GetName(), obj.GetNamespace()).Set(value)
+}
+
+func (m *ObjGaugeVec) Delete(obj metav1.Object) bool {
+	return m.gauge.DeleteLabelValues(obj.GetName(), obj.GetNamespace())
 }

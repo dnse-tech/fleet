@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -27,37 +28,43 @@ func TestExcludeIgnoredConditions(t *testing.T) {
 	}
 	tests := map[string]struct {
 		obj           *unstructured.Unstructured
-		ignoreOptions fleet.IgnoreOptions
+		ignoreOptions *fleet.IgnoreOptions
 		expectedObj   *unstructured.Unstructured
 		expectedErr   error
 	}{
-		"nothing is changed without IgnoreOptions": {
+		"nothing is changed with empty IgnoreOptions": {
 			obj:           &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
-			ignoreOptions: fleet.IgnoreOptions{},
+			ignoreOptions: &fleet.IgnoreOptions{},
+			expectedObj:   &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
+			expectedErr:   nil,
+		},
+		"nothing is changed with nil IgnoreOptions": {
+			obj:           &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
+			ignoreOptions: nil,
 			expectedObj:   &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
 			expectedErr:   nil,
 		},
 		"nothing is changed when IgnoreOptions don't match any condition": {
 			obj:           &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
-			ignoreOptions: fleet.IgnoreOptions{Conditions: []map[string]string{{"Not": "Found"}}},
+			ignoreOptions: &fleet.IgnoreOptions{Conditions: []map[string]string{{"Not": "Found"}}},
 			expectedObj:   &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
 			expectedErr:   nil,
 		},
 		"'Type: Ready' condition is excluded when IgnoreOptions contains 'Type: Ready' condition": {
 			obj:           &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
-			ignoreOptions: fleet.IgnoreOptions{Conditions: []map[string]string{{"type": "Ready"}}},
+			ignoreOptions: &fleet.IgnoreOptions{Conditions: []map[string]string{{"type": "Ready"}}},
 			expectedObj:   &unstructured.Unstructured{Object: uPodInitialized},
 			expectedErr:   nil,
 		},
 		"'Type: Ready' condition is excluded when IgnoreOptions contains 'Type: Ready, status: False' condition": {
 			obj:           &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
-			ignoreOptions: fleet.IgnoreOptions{Conditions: []map[string]string{{"type": "Ready", "status": "False"}}},
+			ignoreOptions: &fleet.IgnoreOptions{Conditions: []map[string]string{{"type": "Ready", "status": "False"}}},
 			expectedObj:   &unstructured.Unstructured{Object: uPodInitialized},
 			expectedErr:   nil,
 		},
 		"nothing is changed when IgnoreOptions contains 'type: Ready, status: True' condition": {
 			obj:           &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
-			ignoreOptions: fleet.IgnoreOptions{Conditions: []map[string]string{{"type": "Ready", "status": "True"}}},
+			ignoreOptions: &fleet.IgnoreOptions{Conditions: []map[string]string{{"type": "Ready", "status": "True"}}},
 			expectedObj:   &unstructured.Unstructured{Object: uPodInitializedAndNotReady},
 			expectedErr:   nil,
 		},
@@ -67,7 +74,7 @@ func TestExcludeIgnoredConditions(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			obj := test.obj
 			err := excludeIgnoredConditions(obj, test.ignoreOptions)
-			if err != test.expectedErr {
+			if !errors.Is(err, test.expectedErr) {
 				t.Errorf("expected error doesn't match: expected %v, got %v", test.expectedErr, err)
 			}
 			if !cmp.Equal(obj, test.expectedObj) {

@@ -100,7 +100,7 @@ func (m *Monitor) UpdateStatus(ctx context.Context, bd *fleet.BundleDeployment, 
 		// When there is no resourceID the error should be on the status. Without
 		// the ID we do not have the information to lookup the resources to
 		// compute the plan and discover the state of resources.
-		if err == helmdeployer.ErrNoResourceID {
+		if errors.Is(err, helmdeployer.ErrNoResourceID) {
 			return origStatus, nil
 		}
 
@@ -256,11 +256,12 @@ func calculateResourceCounts(all []fleet.BundleDeploymentResource, nonReady []fl
 		DesiredReady: calculateDesiredReady(resourceKeys, modified),
 	}
 	for _, r := range modified {
-		if r.Create {
+		switch {
+		case r.Create:
 			counts.Missing++
-		} else if r.Delete {
+		case r.Delete:
 			counts.Orphaned++
-		} else {
+		default:
 			counts.Modified++
 		}
 		delete(resourceKeys, fleet.ResourceKey{
@@ -312,7 +313,7 @@ func calculateDesiredReady(liveResourceKeys map[fleet.ResourceKey]struct{}, modi
 	return desired
 }
 
-func nonReady(ctx context.Context, plan desiredset.Plan, ignoreOptions fleet.IgnoreOptions) (result []fleet.NonReadyStatus) {
+func nonReady(ctx context.Context, plan desiredset.Plan, ignoreOptions *fleet.IgnoreOptions) (result []fleet.NonReadyStatus) {
 	logger := log.FromContext(ctx)
 	defer func() {
 		sort.Slice(result, func(i, j int) bool {
@@ -322,7 +323,7 @@ func nonReady(ctx context.Context, plan desiredset.Plan, ignoreOptions fleet.Ign
 
 	for _, obj := range plan.Objects {
 		if u, ok := obj.(*unstructured.Unstructured); ok {
-			if ignoreOptions.Conditions != nil {
+			if ignoreOptions != nil && ignoreOptions.Conditions != nil {
 				if err := excludeIgnoredConditions(u, ignoreOptions); err != nil {
 					logger.Error(err, "failed to ignore conditions")
 				}
@@ -438,7 +439,11 @@ func isResourceInPreviousRelease(key objectset.ObjectKey, kind string, objsPrevi
 }
 
 // excludeIgnoredConditions removes the conditions that are included in ignoreOptions from the object passed as a parameter
-func excludeIgnoredConditions(obj *unstructured.Unstructured, ignoreOptions fleet.IgnoreOptions) error {
+func excludeIgnoredConditions(obj *unstructured.Unstructured, ignoreOptions *fleet.IgnoreOptions) error {
+	if ignoreOptions == nil {
+		return nil
+	}
+
 	conditions, _, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil {
 		return err

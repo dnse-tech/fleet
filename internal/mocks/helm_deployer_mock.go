@@ -15,13 +15,13 @@ import (
 
 	helmdeployer "github.com/rancher/fleet/internal/helmdeployer"
 	gomock "go.uber.org/mock/gomock"
-	action "helm.sh/helm/v3/pkg/action"
 )
 
 // MockHelmDeployer is a mock of HelmDeployer interface.
 type MockHelmDeployer struct {
 	ctrl     *gomock.Controller
 	recorder *MockHelmDeployerMockRecorder
+	isgomock struct{}
 }
 
 // MockHelmDeployerMockRecorder is the mock recorder for MockHelmDeployer.
@@ -42,53 +42,53 @@ func (m *MockHelmDeployer) EXPECT() *MockHelmDeployerMockRecorder {
 }
 
 // Delete mocks base method.
-func (m *MockHelmDeployer) Delete(arg0 context.Context, arg1 string) error {
+func (m *MockHelmDeployer) Delete(ctx context.Context, name string) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Delete", arg0, arg1)
+	ret := m.ctrl.Call(m, "Delete", ctx, name)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // Delete indicates an expected call of Delete.
-func (mr *MockHelmDeployerMockRecorder) Delete(arg0, arg1 any) *gomock.Call {
+func (mr *MockHelmDeployerMockRecorder) Delete(ctx, name any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockHelmDeployer)(nil).Delete), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockHelmDeployer)(nil).Delete), ctx, name)
 }
 
 // DeleteRelease mocks base method.
-func (m *MockHelmDeployer) DeleteRelease(arg0 context.Context, arg1 helmdeployer.DeployedBundle) error {
+func (m *MockHelmDeployer) DeleteRelease(ctx context.Context, deployed helmdeployer.DeployedBundle) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DeleteRelease", arg0, arg1)
+	ret := m.ctrl.Call(m, "DeleteRelease", ctx, deployed)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // DeleteRelease indicates an expected call of DeleteRelease.
-func (mr *MockHelmDeployerMockRecorder) DeleteRelease(arg0, arg1 any) *gomock.Call {
+func (mr *MockHelmDeployerMockRecorder) DeleteRelease(ctx, deployed any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteRelease", reflect.TypeOf((*MockHelmDeployer)(nil).DeleteRelease), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteRelease", reflect.TypeOf((*MockHelmDeployer)(nil).DeleteRelease), ctx, deployed)
 }
 
 // ListDeployments mocks base method.
-func (m *MockHelmDeployer) ListDeployments(arg0 helmdeployer.ListAction) ([]helmdeployer.DeployedBundle, error) {
+func (m *MockHelmDeployer) ListDeployments(list helmdeployer.ListAction) ([]helmdeployer.DeployedBundle, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ListDeployments", arg0)
+	ret := m.ctrl.Call(m, "ListDeployments", list)
 	ret0, _ := ret[0].([]helmdeployer.DeployedBundle)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // ListDeployments indicates an expected call of ListDeployments.
-func (mr *MockHelmDeployerMockRecorder) ListDeployments(arg0 any) *gomock.Call {
+func (mr *MockHelmDeployerMockRecorder) ListDeployments(list any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListDeployments", reflect.TypeOf((*MockHelmDeployer)(nil).ListDeployments), arg0)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListDeployments", reflect.TypeOf((*MockHelmDeployer)(nil).ListDeployments), list)
 }
 
 // NewListAction mocks base method.
-func (m *MockHelmDeployer) NewListAction() *action.List {
+func (m *MockHelmDeployer) NewListAction() helmdeployer.ListAction {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "NewListAction")
-	ret0, _ := ret[0].(*action.List)
+	ret0, _ := ret[0].(helmdeployer.ListAction)
 	return ret0
 }
 

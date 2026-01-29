@@ -55,12 +55,15 @@ var _ = Context("Benchmarks Targeting", func() {
 					})
 					g.Expect(err).ToNot(HaveOccurred())
 					g.Expect(list.Items).To(HaveLen(n * 50))
-				}).Should(Succeed())
+				}).WithTimeout(MediumTimeout).WithPolling(PollingInterval).Should(Succeed())
 			}, gm.Style("{{bold}}"))
 		})
 	})
 
 	Describe("Adding 150 Bundles", Label("create-150-bundle"), func() {
+		// This test creates 150 bundles targeting all clusters. With
+		// 5000 clusters this results in 750,000 BundleDeployments
+		// resources, which is too much for etcd.
 		BeforeEach(func() {
 			name = "create-150-bundle"
 			info = "creating 150 bundles targeting each cluster"
@@ -73,6 +76,10 @@ var _ = Context("Benchmarks Targeting", func() {
 		})
 
 		It("creates 150 bundledeployments", func() {
+			if n > 1000 {
+				Skip("Skipping test with more than 1000 clusters, as it would create too many BundleDeployments")
+			}
+
 			DeferCleanup(func() {
 				_, _ = k.Delete("-f", manifest)
 			})
@@ -88,7 +95,7 @@ var _ = Context("Benchmarks Targeting", func() {
 					})
 					g.Expect(err).ToNot(HaveOccurred())
 					g.Expect(list.Items).To(HaveLen(n * 150))
-				}).Should(Succeed())
+				}).WithTimeout(LongTimeout).WithPolling(LongPollingInterval).Should(Succeed())
 			}, gm.Style("{{bold}}"))
 		})
 	})

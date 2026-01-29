@@ -21,6 +21,7 @@ var (
 	// Default limit is 100%, make sure the default behavior doesn't block rollout
 	defLimit                    = intstr.FromString("100%")
 	defAutoPartitionSize        = intstr.FromString("25%")
+	defAutoPartitionThreshold   = 200
 	defMaxUnavailablePartitions = intstr.FromInt(0)
 )
 
@@ -37,6 +38,9 @@ func BundleFromDeployment(labels map[string]string) (string, string) {
 		labels[fleet.BundleLabel]
 }
 
+// Target represents a bundle deployment target, encapsulating all relevant
+// information about the deployment, associated cluster groups, cluster,
+// bundle, deployment options, and deployment identifier.
 type Target struct {
 	Deployment    *fleet.BundleDeployment
 	ClusterGroups []*fleet.ClusterGroup
@@ -46,7 +50,7 @@ type Target struct {
 	DeploymentID  string
 }
 
-// BundleDeployment returns a new bd, it discards annotations, status, etc.
+// BundleDeployment returns a new BundleDeployment, it discards annotations, status, etc.
 // The labels are copied from the Bundle.
 func (t *Target) BundleDeployment() *fleet.BundleDeployment {
 	bd := &fleet.BundleDeployment{
@@ -54,10 +58,12 @@ func (t *Target) BundleDeployment() *fleet.BundleDeployment {
 			Name:      t.Deployment.Name,
 			Namespace: t.Deployment.Namespace,
 			Labels:    t.BundleDeploymentLabels(t.Cluster.Namespace, t.Cluster.Name),
+			UID:       t.Deployment.UID, // useful for optimised owner reference population if the BD already exists.
 		},
 		Spec: t.Deployment.Spec,
 	}
 	bd.Spec.Paused = t.IsPaused()
+	bd.Spec.OffSchedule = t.Cluster.Status.Scheduled && !t.Cluster.Status.ActiveSchedule
 
 	initialiseOptionsMaps(bd)
 

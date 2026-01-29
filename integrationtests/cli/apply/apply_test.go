@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -48,6 +49,23 @@ var _ = Describe("Fleet apply", Ordered, func() {
 		})
 	})
 
+	When("folder contains simple resources and a fleet.yaml specifying a bundle name", func() {
+		BeforeEach(func() {
+			name = "simple"
+			dirs = []string{cli.AssetsPath + "simple-fleet-yaml"}
+		})
+
+		It("creates a bundle with that name, containing all the resources, and keepResources is false", func() {
+			bundle, err := cli.GetBundleFromOutput(buf)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(bundle.Spec.Resources).To(HaveLen(2))
+			Expect(bundle.Name).To(Equal("my-great-bundle"))
+			Expect(dirs[0] + "/svc.yaml").To(bePresentInBundleResources(bundle.Spec.Resources))
+			Expect(dirs[0] + "/deployment.yaml").To(bePresentInBundleResources(bundle.Spec.Resources))
+			Expect(bundle.Spec.KeepResources).Should(BeFalse())
+		})
+	})
+
 	When("simple resources in a nested folder", func() {
 		BeforeEach(func() {
 			name = "nested_simple"
@@ -86,12 +104,26 @@ var _ = Describe("Fleet apply", Ordered, func() {
 		})
 
 		It("then 3 Bundles are created with the relevant resources", func() {
-			bundle, err := cli.GetBundleListFromOutput(buf)
+			bundles, err := cli.GetBundleListFromOutput(buf)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(bundle).To(HaveLen(3))
-			deploymentA := bundle[0]
-			deploymentB := bundle[1]
-			deploymentC := bundle[2]
+			Expect(bundles).To(HaveLen(3))
+
+			deploymentA, i, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return strings.Contains(bundle.Name, "-deploymenta-")
+			})
+			Expect(ok).To(BeTrue())
+			bundles = append(bundles[:i], bundles[i+1:]...)
+
+			deploymentB, i, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return strings.Contains(bundle.Name, "-deploymentb-")
+			})
+			Expect(ok).To(BeTrue())
+			bundles = append(bundles[:i], bundles[i+1:]...)
+
+			deploymentC, _, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return strings.Contains(bundle.Name, "-deploymentc-")
+			})
+			Expect(ok).To(BeTrue())
 
 			Expect(deploymentA.Spec.Resources).To(HaveLen(1))
 			Expect(deploymentB.Spec.Resources).To(HaveLen(1))
@@ -110,12 +142,23 @@ var _ = Describe("Fleet apply", Ordered, func() {
 		})
 
 		It("then Bundles are created with all the resources", func() {
-			bundle, err := cli.GetBundleListFromOutput(buf)
+			bundles, err := cli.GetBundleListFromOutput(buf)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(bundle).To(HaveLen(3))
-			root := bundle[0]
-			deploymentA := bundle[1]
-			deploymentC := bundle[2]
+			Expect(bundles).To(HaveLen(3))
+
+			deploymentA, i, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return bundle.Spec.TargetNamespace == "deploymenta"
+			})
+			Expect(ok).To(BeTrue())
+			bundles = append(bundles[:i], bundles[i+1:]...)
+
+			deploymentC, i, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return bundle.Spec.TargetNamespace == "deploymentc"
+			})
+			Expect(ok).To(BeTrue())
+			bundles = append(bundles[:i], bundles[i+1:]...)
+
+			root := bundles[0] // remaining
 
 			Expect(deploymentA.Spec.Resources).To(HaveLen(1))
 			Expect(deploymentC.Spec.Resources).To(HaveLen(1))
@@ -193,6 +236,38 @@ var _ = Describe("Fleet apply", Ordered, func() {
 			})
 		})
 	})
+
+	When("a fleet.yaml located beside a local chart dir references a values file prefixed by its directory", func() {
+		BeforeEach(func() {
+			name = "helm-values-ignore"
+			dirs = []string{cli.AssetsPath + name}
+		})
+
+		It("creates a bundle without the values file", func() {
+			bundle, err := cli.GetBundleFromOutput(buf)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(bundle.Spec.Resources).To(HaveLen(2))
+
+			Expect(cli.AssetsPath + "helm-values-ignore/config-chart/templates/configmap.yaml").To(bePresentInBundleResources(bundle.Spec.Resources))
+			Expect(cli.AssetsPath + "helm-values-ignore/config-chart/Chart.yaml").To(bePresentInBundleResources(bundle.Spec.Resources))
+		})
+	})
+
+	When("a fleet.yaml located within a local chart dir references a values file prefixed by its directory", func() {
+		BeforeEach(func() {
+			name = "helm-in-chart-fleetyaml-values-ignore"
+			dirs = []string{cli.AssetsPath + name}
+		})
+
+		It("creates a bundle without the values file", func() {
+			bundle, err := cli.GetBundleFromOutput(buf)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(bundle.Spec.Resources).To(HaveLen(2))
+
+			Expect(cli.AssetsPath + "helm-in-chart-fleetyaml-values-ignore/config-chart/templates/configmap.yaml").To(bePresentInBundleResources(bundle.Spec.Resources))
+			Expect(cli.AssetsPath + "helm-in-chart-fleetyaml-values-ignore/config-chart/Chart.yaml").To(bePresentInBundleResources(bundle.Spec.Resources))
+		})
+	})
 })
 
 var _ = Describe("Fleet apply driven", Ordered, func() {
@@ -238,8 +313,8 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 			Expect(bundles).To(HaveLen(4))
 
 			// helm bundle
-			helmBundle := bundles[0]
-			Expect(helmBundle.Name).To(Equal("assets-driven-helm"))
+			helmBundle := getBundleNamed("assets-driven-helm", bundles)
+			Expect(helmBundle).To(Not(BeNil()))
 			Expect(helmBundle.Spec.Resources).To(HaveLen(3))
 			// as files were unpacked from the downloaded chart we can't just
 			// list the files in the original folder and compare.
@@ -253,8 +328,8 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 			Expect(helmBundle.Spec.Helm.Chart).To(Equal("http://localhost:3000/config-chart-0.1.0.tgz"))
 
 			// simple bundle
-			simpleBundle := bundles[1]
-			Expect(simpleBundle.Name).To(Equal("assets-driven-simple"))
+			simpleBundle := getBundleNamed("assets-driven-simple", bundles)
+			Expect(simpleBundle).ToNot(BeNil())
 			Expect(simpleBundle.Spec.Resources).To(HaveLen(2))
 			expectedResources := []string{
 				cli.AssetsPath + "driven/simple/deployment.yaml",
@@ -265,12 +340,12 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 			}
 
 			// kustomize dev bundle
-			kDevBundle := bundles[2]
-			Expect(kDevBundle.Name).To(Equal("assets-driven-kustomize-dev"))
+			kDevBundle := getBundleNamed("assets-driven-kustomize-dev", bundles)
+			Expect(kDevBundle).ToNot(BeNil())
 
 			// kustomize prod bundle
-			kProdBundle := bundles[3]
-			Expect(kProdBundle.Name).To(Equal("assets-driven-kustomize-prod"))
+			kProdBundle := getBundleNamed("assets-driven-kustomize-prod", bundles)
+			Expect(kProdBundle).ToNot(BeNil())
 
 			// both kustomize bundles have the same resources, but different config fleet.yaml
 			kResources := []string{
@@ -280,13 +355,26 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 				cli.AssetsPath + "driven/kustomize/overlays/dev/secret.yaml",
 				cli.AssetsPath + "driven/kustomize/overlays/prod/kustomization.yaml",
 				cli.AssetsPath + "driven/kustomize/overlays/prod/secret.yaml",
-				cli.AssetsPath + "driven/kustomize/dev.yaml",
-				cli.AssetsPath + "driven/kustomize/prod.yaml",
 			}
-			Expect(kDevBundle.Spec.Resources).To(HaveLen(8))
-			Expect(kProdBundle.Spec.Resources).To(HaveLen(8))
-			for _, r := range kResources {
+
+			// Note: the presence of a .fleetignore file, at the same level as both `dev.yaml` and
+			// `prod.yaml`, excluding only `dev.yaml`, enables us to ensure that that file does not end up in
+			// any bundle, being excluded from the dev bundle, but _also_ from the prod bundle.
+			// We deliberately don't exclude both `dev.yaml` and `prod.yaml` from `.fleetignore`, simply to
+			// validate that `prod.yaml` is excluded from the prod bundle without needing to be excluded from
+			// `.fleetignore`.
+
+			kDevResources := append(slices.Clone(kResources), cli.AssetsPath+"driven/kustomize/prod.yaml")
+			kProdResources := slices.Clone(kResources)
+
+			Expect(kDevBundle.Spec.Resources).To(HaveLen(7))
+			Expect(kProdBundle.Spec.Resources).To(HaveLen(6))
+
+			for _, r := range kDevResources {
 				Expect(r).To(bePresentInBundleResources(kDevBundle.Spec.Resources))
+			}
+
+			for _, r := range kProdResources {
 				Expect(r).To(bePresentInBundleResources(kProdBundle.Spec.Resources))
 			}
 
@@ -313,12 +401,12 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 			Expect(bundles).To(HaveLen(2))
 
 			// kustomize dev bundle
-			kDevBundle := bundles[0]
-			Expect(kDevBundle.Name).To(Equal("assets-driven2-kustomize-fleetdev-2946f474"))
+			kDevBundle := getBundleNamed("assets-driven2-kustomize-fleetdev-2946f474", bundles)
+			Expect(kDevBundle).NotTo(BeNil())
 
 			// kustomize prod bundle
-			kProdBundle := bundles[1]
-			Expect(kProdBundle.Name).To(Equal("assets-driven2-kustomize-fleetprod-99f597b0"))
+			kProdBundle := getBundleNamed("assets-driven2-kustomize-fleetprod-99f597b0", bundles)
+			Expect(kProdBundle).NotTo(BeNil())
 
 			// both kustomize bundles have the same resources, but different config fleet.yaml
 			kResources := []string{
@@ -328,13 +416,26 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 				cli.AssetsPath + "driven2/kustomize/overlays/dev/secret.yaml",
 				cli.AssetsPath + "driven2/kustomize/overlays/prod/kustomization.yaml",
 				cli.AssetsPath + "driven2/kustomize/overlays/prod/secret.yaml",
-				cli.AssetsPath + "driven2/kustomize/fleetDev.yaml",
-				cli.AssetsPath + "driven2/kustomize/fleetProd.yaml",
 			}
-			Expect(kDevBundle.Spec.Resources).To(HaveLen(8))
-			Expect(kProdBundle.Spec.Resources).To(HaveLen(8))
-			for _, r := range kResources {
+
+			// Note: the presence of a .fleetignore file, at the same level as both `fleetDev.yaml` and
+			// `fleetProd.yaml`, excluding only `fleetProd.yaml`, enables us to ensure that that file does
+			// not end up in any bundle, being excluded from the prod bundle, but _also_ from the dev bundle.
+			// We deliberately don't exclude both `fleetDev.yaml` and `fleetProd.yaml` from `.fleetignore`,
+			// simply to validate that `fleetDev.yaml` is excluded from the dev bundle without needing to be
+			// excluded from `.fleetignore`.
+
+			kDevResources := slices.Clone(kResources)
+			kProdResources := append(slices.Clone(kResources), cli.AssetsPath+"driven2/kustomize/fleetDev.yaml")
+
+			Expect(kDevBundle.Spec.Resources).To(HaveLen(6))
+			Expect(kProdBundle.Spec.Resources).To(HaveLen(7))
+
+			for _, r := range kDevResources {
 				Expect(r).To(bePresentInBundleResources(kDevBundle.Spec.Resources))
+			}
+
+			for _, r := range kProdResources {
 				Expect(r).To(bePresentInBundleResources(kProdBundle.Spec.Resources))
 			}
 
@@ -399,7 +500,7 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 			// helm bundle
 			helmBundle := bundles[0]
 			Expect(helmBundle.Name).To(Equal("assets-driven-fleet-yaml-subfolder-helm-test-fl-b676f"))
-			Expect(helmBundle.Spec.Resources).To(HaveLen(4))
+			Expect(helmBundle.Spec.Resources).To(HaveLen(3))
 			// as files were unpacked from the downloaded chart we can't just
 			// list the files in the original folder and compare.
 			// Files are only located in the bundle resources
@@ -407,7 +508,7 @@ var _ = Describe("Fleet apply driven", Ordered, func() {
 			Expect("values.yaml").To(bePresentOnlyInBundleResources(helmBundle.Spec.Resources))
 			Expect("templates/configmap.yaml").To(bePresentOnlyInBundleResources(helmBundle.Spec.Resources))
 			resPath := cli.AssetsPath + "driven_fleet_yaml_subfolder/helm/test/fleet.yaml"
-			Expect(resPath).To(bePresentInBundleResources(helmBundle.Spec.Resources))
+			Expect(resPath).NotTo(bePresentInBundleResources(helmBundle.Spec.Resources))
 			// check for helm options defined in the fleet.yaml file
 			Expect(helmBundle.Spec.Helm).ToNot(BeNil())
 			Expect(helmBundle.Spec.Helm.ReleaseName).To(Equal("config-chart"))
@@ -581,12 +682,21 @@ var _ = Describe("Fleet apply with helm charts with dependencies", Ordered, func
 		})
 
 		It("creates Bundles with the corresponding resources, depending if they should update dependencies", func() {
-			bundle, err := cli.GetBundleListFromOutput(buf)
+			bundles, err := cli.GetBundleListFromOutput(buf)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(bundle).To(HaveLen(3))
-			remoteDepl := bundle[0]
-			simpleDepl := bundle[1]
-			noDepsDepl := bundle[2]
+			Expect(bundles).To(HaveLen(3))
+			remoteDepl, _, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return bundle.Spec.Helm.ReleaseName == "remote-chart-with-deps"
+			})
+			Expect(ok).To(BeTrue())
+			simpleDepl, _, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return bundle.Spec.Helm.ReleaseName == "simple-with-fleet-yaml"
+			})
+			Expect(ok).To(BeTrue())
+			noDepsDepl, _, ok := sliceFind(bundles, func(bundle *v1alpha1.Bundle) bool {
+				return bundle.Spec.Helm.ReleaseName == "simple-with-fleet-yaml-no-deps"
+			})
+			Expect(ok).To(BeTrue())
 
 			// remoteDepl corresponds to multi-chart/remote-chart-with-deps
 			// expected files are:
@@ -689,4 +799,19 @@ func getAllFilesInDir(chartPath string) ([]string, error) {
 		return nil
 	})
 	return files, err
+}
+
+func sliceFind[T any](s []T, f func(T) bool) (T, int, bool) {
+	if x := slices.IndexFunc(s, f); x >= 0 {
+		return s[x], x, true
+	}
+	var zero T
+	return zero, -1, false
+}
+
+func getBundleNamed(name string, bundles []*v1alpha1.Bundle) *v1alpha1.Bundle {
+	res, _, _ := sliceFind(bundles, func(b *v1alpha1.Bundle) bool {
+		return b.Name == name
+	})
+	return res
 }

@@ -26,10 +26,11 @@ import (
 
 type FleetController struct {
 	command.DebugConfig
-	Kubeconfig     string `usage:"Kubeconfig file"`
-	Namespace      string `usage:"namespace to watch" default:"cattle-fleet-system" env:"NAMESPACE"`
-	DisableMetrics bool   `usage:"disable metrics" name:"disable-metrics"`
-	ShardID        string `usage:"only manage resources labeled with a specific shard ID" name:"shard-id"`
+	Kubeconfig           string `usage:"Kubeconfig file"`
+	Namespace            string `usage:"namespace to watch" default:"cattle-fleet-system" env:"NAMESPACE"`
+	DisableMetrics       bool   `usage:"disable metrics" name:"disable-metrics"`
+	ShardID              string `usage:"only manage resources labeled with a specific shard ID" name:"shard-id"`
+	EnableLeaderElection bool   `name:"leader-elect" default:"true" usage:"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager."`
 }
 
 type ControllerReconcilerWorkers struct {
@@ -38,6 +39,8 @@ type ControllerReconcilerWorkers struct {
 	Cluster          int
 	ClusterGroup     int
 	ImageScan        int
+	Schedule         int
+	Content          int
 }
 
 type BindAddresses struct {
@@ -124,13 +127,30 @@ func (f *FleetController) Run(cmd *cobra.Command, args []string) error {
 		workersOpts.ImageScan = w
 	}
 
+	if d := os.Getenv("SCHEDULE_RECONCILER_WORKERS"); d != "" {
+		w, err := strconv.Atoi(d)
+		if err != nil {
+			setupLog.Error(err, "failed to parse SCHEDULE_RECONCILER_WORKERS", "value", d)
+		}
+		workersOpts.Schedule = w
+	}
+
+	if d := os.Getenv("CONTENT_RECONCILER_WORKERS"); d != "" {
+		w, err := strconv.Atoi(d)
+		if err != nil {
+			setupLog.Error(err, "failed to parse CONTENT_RECONCILER_WORKERS", "value", d)
+		}
+		workersOpts.Content = w
+	}
+
 	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil)) // nolint:gosec // Debugging only
+		log.Println(http.ListenAndServe("localhost:6060", nil)) //nolint:gosec // Debugging only
 	}()
 	if err := start(
 		ctx,
 		f.Namespace,
 		kubeconfig,
+		f.EnableLeaderElection,
 		leaderOpts,
 		workersOpts,
 		bindAddresses,

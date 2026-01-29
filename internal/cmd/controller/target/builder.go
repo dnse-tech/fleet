@@ -12,6 +12,7 @@ import (
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/rancher/fleet/internal/cmd/controller/options"
 	"github.com/rancher/fleet/internal/cmd/controller/target/matcher"
@@ -63,20 +64,19 @@ func (m *Manager) Targets(ctx context.Context, bundle *fleet.Bundle, manifestID 
 			return nil, err
 		}
 		for _, cluster := range clusters.Items {
-			cluster := cluster
 			logger.V(4).Info("Cluster has namespace?", "cluster", cluster.Name, "namespace", cluster.Status.Namespace)
 			clusterGroups, err := m.clusterGroupsForCluster(ctx, &cluster)
 			if err != nil {
 				return nil, err
 			}
 
-			target := bm.Match(cluster.Name, clusterGroupsToLabelMap(clusterGroups), cluster.Labels)
+			target := bm.Match(cluster.Name, ClusterGroupsToLabelMap(clusterGroups), cluster.Labels)
 			if target == nil {
 				continue
 			}
 			// check if there is any matching targetCustomization that should be applied
 			targetOpts := target.BundleDeploymentOptions
-			targetCustomized := bm.MatchTargetCustomizations(cluster.Name, clusterGroupsToLabelMap(clusterGroups), cluster.Labels)
+			targetCustomized := bm.MatchTargetCustomizations(cluster.Name, ClusterGroupsToLabelMap(clusterGroups), cluster.Labels)
 			if targetCustomized != nil {
 				if targetCustomized.DoNotDeploy {
 					logger.V(1).Info("BundleDeployment creation for Bundle was skipped because doNotDeploy is set to true.")
@@ -122,11 +122,18 @@ func (m *Manager) Targets(ctx context.Context, bundle *fleet.Bundle, manifestID 
 
 	byNamespace := map[string]*fleet.BundleDeployment{}
 	for _, bd := range bundleDeployments.Items {
+		bd := bd.DeepCopy()
+		byNamespace[bd.Namespace] = bd
+
 		// and set their options
 		if bd.Spec.ValuesHash != "" {
 			secret := &corev1.Secret{}
 			if err := m.reader.Get(ctx, client.ObjectKey{Namespace: bd.Namespace, Name: bd.Name}, secret); err != nil {
-				return nil, fmt.Errorf("failed to get options secret for bundledeployment %s/%s, this is likely temporary: %w", bd.Namespace, bd.Name, err)
+				if apierrors.IsNotFound(err) {
+					logger.V(1).Info("failed to get options secret for bundledeployment %s/%s, this is likely temporary", bd.Namespace, bd.Name)
+					continue
+				}
+				return nil, err
 			}
 
 			h := helmvalues.HashOptions(secret.Data[helmvalues.ValuesKey], secret.Data[helmvalues.StagedValuesKey])
@@ -134,12 +141,11 @@ func (m *Manager) Targets(ctx context.Context, bundle *fleet.Bundle, manifestID 
 				return nil, fmt.Errorf("retrying, hash mismatch between secret and bundledeployment: actual %s != expected %s", h, bd.Spec.ValuesHash)
 			}
 
-			if err := helmvalues.SetOptions(&bd, secret.Data); err != nil {
+			if err := helmvalues.SetOptions(bd, secret.Data); err != nil {
 				return nil, err
 			}
 		}
 
-		byNamespace[bd.Namespace] = &bd
 	}
 
 	for _, target := range targets {
@@ -164,7 +170,6 @@ func (m *Manager) getNamespacesForBundle(ctx context.Context, bundle *fleet.Bund
 	nses := sets.NewString(bundle.Namespace)
 	for _, mapping := range mappings.Items {
 		logger.V(4).Info("Looking for matching namespaces", "bundleNamespaceMapping", mapping)
-		mapping := mapping // fix gosec warning regarding "Implicit memory aliasing in for loop"
 		matcher, err := newBundleMapping(&mapping)
 		if err != nil {
 			logger.Error(err, "invalid BundleNamespaceMapping skipping", "mappingNamespace", mapping.Namespace, "mappingName", mapping.Name)
@@ -336,7 +341,7 @@ func processTemplateValuesData(helmTemplateData map[string]string, templateConte
 		var value interface{}
 		err = kyaml.Unmarshal(b.Bytes(), &value)
 		if err != nil {
-			return nil, fmt.Errorf("failed to interpret rendered template as helm values: %s, %v", b.String(), err)
+			return nil, fmt.Errorf("failed to interpret rendered template as helm values: %s, %w", b.String(), err)
 		}
 
 		renderedValues[k] = value
@@ -370,7 +375,7 @@ func processTemplateValues(helmValues map[string]interface{}, templateContext ma
 	var renderedValues map[string]interface{}
 	err = kyaml.Unmarshal(b.Bytes(), &renderedValues)
 	if err != nil {
-		return nil, fmt.Errorf("failed to interpret rendered template as helm values: %#v, %v", renderedValues, err)
+		return nil, fmt.Errorf("failed to interpret rendered template as helm values: %#v, %w", renderedValues, err)
 	}
 
 	return renderedValues, nil

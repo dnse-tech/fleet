@@ -3,6 +3,7 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,7 +25,7 @@ import (
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -105,7 +106,9 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			w.logAndReturn(rw, err)
 			return
 		}
-		path := strings.Replace(u.Path[1:], "/_git/", "(/_git)?/", 1)
+
+		path := strings.Replace(u.EscapedPath()[1:], "/_git/", "(/_git)?/", 1)
+
 		regexpStr := `(?i)(http://|https://|\w+@|ssh://(\w+@)?|git@(ssh\.)?)` + u.Hostname() +
 			"(:[0-9]+|)[:/](v\\d/)?" + path + "(\\.git)?"
 		repoRegexp, err := regexp.Compile(regexpStr)
@@ -216,7 +219,7 @@ func (w *Webhook) getSecret(ctx context.Context, gitrepo fleet.GitRepo) (*corev1
 	var secret corev1.Secret
 	err := w.client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: ns}, &secret)
 	if err != nil {
-		if !errors.IsNotFound(err) {
+		if !apierrors.IsNotFound(err) {
 			return nil, err
 		}
 		if !mustExist {
@@ -231,23 +234,23 @@ func getErrorCodeFromErr(err error) int {
 	// check if the error is a verification of identity error
 	// secret check, or basic credentials or token verification
 	// depending on the provider
-	switch err {
+	switch {
 	case
-		gogs.ErrHMACVerificationFailed,
-		github.ErrHMACVerificationFailed,
-		gitlab.ErrGitLabTokenVerificationFailed,
-		bitbucket.ErrUUIDVerificationFailed,
-		bitbucketserver.ErrHMACVerificationFailed,
-		azuredevops.ErrBasicAuthVerificationFailed:
+		errors.Is(err, gogs.ErrHMACVerificationFailed),
+		errors.Is(err, github.ErrHMACVerificationFailed),
+		errors.Is(err, gitlab.ErrGitLabTokenVerificationFailed),
+		errors.Is(err, bitbucket.ErrUUIDVerificationFailed),
+		errors.Is(err, bitbucketserver.ErrHMACVerificationFailed),
+		errors.Is(err, azuredevops.ErrBasicAuthVerificationFailed):
 
 		return http.StatusUnauthorized
 	case
-		gogs.ErrInvalidHTTPMethod,
-		github.ErrInvalidHTTPMethod,
-		gitlab.ErrInvalidHTTPMethod,
-		bitbucket.ErrInvalidHTTPMethod,
-		bitbucketserver.ErrInvalidHTTPMethod,
-		azuredevops.ErrInvalidHTTPMethod:
+		errors.Is(err, gogs.ErrInvalidHTTPMethod),
+		errors.Is(err, github.ErrInvalidHTTPMethod),
+		errors.Is(err, gitlab.ErrInvalidHTTPMethod),
+		errors.Is(err, bitbucket.ErrInvalidHTTPMethod),
+		errors.Is(err, bitbucketserver.ErrInvalidHTTPMethod),
+		errors.Is(err, azuredevops.ErrInvalidHTTPMethod):
 
 		return http.StatusMethodNotAllowed
 	}
@@ -320,6 +323,27 @@ func parsePayload(payload interface{}) (revision, branch, tag string, repoURLs [
 		revision = t.After
 	case azuredevops.GitPushEvent:
 		repoURLs = append(repoURLs, t.Resource.Repository.RemoteURL)
+
+		// This is to make sure that there's URL matching between:
+		// 1. https://org.visualstudio.com/project/_git/repo
+		// 2. https://dev.azure.com/org/project/_git/repo
+		// As stated by Microsoft [here](https://learn.microsoft.com/en-us/azure/devops/release-notes/2018/sep-10-azure-devops-launch#switch-existing-organizations-to-use-the-new-domain-name-url)
+		// There are multiple URLs formats and these may overlap in different areas of Azure DevOps
+		for i, u := range repoURLs {
+			parsed, err := url.Parse(u)
+			if err != nil {
+				continue
+			}
+			if strings.HasSuffix(parsed.Hostname(), ".visualstudio.com") {
+				org := strings.SplitN(parsed.Hostname(), ".", 2)[0]
+				parsed.Host = "dev.azure.com"
+				// parsed.Path is prefixed with a slash, hence no need to add it to the formatting
+				// string.
+				parsed.Path = fmt.Sprintf("/%s%s", org, parsed.Path)
+				repoURLs[i] = parsed.String()
+			}
+		}
+
 		for _, refUpdate := range t.Resource.RefUpdates {
 			branch, tag = getBranchTagFromRef(refUpdate.Name)
 			revision = refUpdate.NewObjectID

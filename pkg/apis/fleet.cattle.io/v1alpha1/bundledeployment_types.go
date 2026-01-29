@@ -25,6 +25,9 @@ const (
 
 	// SecretTypeBundleDeploymentOptions is the type of the secret that stores the deployment values options.
 	SecretTypeBundleDeploymentOptions = "fleet.cattle.io/bundle-deployment/v1alpha1"
+
+	BundleDeploymentOwnershipLabel = "fleet.cattle.io/bundledeployment"
+	ContentNameLabel               = "fleet.cattle.io/content-name"
 )
 
 const IgnoreOp = "ignore"
@@ -97,8 +100,8 @@ type BundleDeploymentOptions struct {
 	DeleteNamespace bool `json:"deleteNamespace,omitempty"`
 
 	//IgnoreOptions can be used to ignore fields when monitoring the bundle.
-	// +optional
-	IgnoreOptions `json:"ignore,omitempty"`
+	// +nullable
+	IgnoreOptions *IgnoreOptions `json:"ignore,omitempty"`
 
 	// CorrectDrift specifies how drift correction should work.
 	CorrectDrift *CorrectDrift `json:"correctDrift,omitempty"`
@@ -113,6 +116,14 @@ type BundleDeploymentOptions struct {
 
 	// DeleteCRDResources deletes CRDs. Warning! this will also delete all your Custom Resources.
 	DeleteCRDResources bool `json:"deleteCRDResources,omitempty"`
+
+	// DownstreamResources points to resources to be copied into downstream clusters, from the bundle's
+	// namespace.
+	DownstreamResources []DownstreamResource `json:"downstreamResources,omitempty"`
+
+	// Overwrites indicates which resources, if any, come from this bundle and overwrite another existing bundle.
+	// This flag is set internally by Fleet, and should not be altered by users.
+	Overwrites []OverwrittenResource `json:"overwrites,omitempty"`
 }
 
 // GitOpsBundleDeploymentOptions contains options which only make sense for GitOps
@@ -351,6 +362,15 @@ type BundleDeploymentSpec struct {
 	// ValuesHash is the hash of the values used to deploy the bundle.
 	// +nullable
 	ValuesHash string `json:"valuesHash,omitempty"`
+	// DownstreamResourcesGeneration is used to track changes to DownstreamResources.
+	// It is incremented every time DownstreamResources are modified.
+	DownstreamResourcesGeneration int64 `json:"downstreamResourcesGeneration,omitempty"`
+	// OffSchedule specifies if the BundleDeployment can be updated.
+	// If set to true, will stop any BundleDeployments from being
+	// updated.
+	// If true, BundleDeployments will be marked as out of sync
+	// when changes are detected.
+	OffSchedule bool `json:"offSchedule,omitempty"`
 }
 
 // BundleDeploymentResource contains the metadata of a deployed resource.
@@ -365,6 +385,13 @@ type BundleDeploymentResource struct {
 	Name string `json:"name,omitempty"`
 	// +nullable
 	CreatedAt metav1.Time `json:"createdAt,omitempty"`
+}
+
+// DownstreamResource contains identifiers for a resource to be copied from the parent bundle's namespace to each
+// downstream cluster.
+type DownstreamResource struct {
+	Kind string `json:"kind,omitempty"`
+	Name string `json:"name,omitempty"`
 }
 
 type BundleDeploymentStatus struct {
@@ -393,6 +420,10 @@ type BundleDeploymentStatus struct {
 	Resources []BundleDeploymentResource `json:"resources,omitempty"`
 	// ResourceCounts contains the number of resources in each state.
 	ResourceCounts ResourceCounts `json:"resourceCounts,omitempty"`
+	// DownstreamResourcesGeneration is used to track changes to DownstreamResources.
+	// It is incremented every time DownstreamResources are modified and reflects the value in the spec
+	// after it has been processed.
+	DownstreamResourcesGeneration int64 `json:"downstreamResourcesGeneration,omitempty"`
 }
 
 type BundleDeploymentDisplay struct {

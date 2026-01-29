@@ -1,20 +1,41 @@
 name: Release Fleet against test Rancher charts repo
 on:
-  schedule:
-    # Run everyday at 1:00 PM
-    - cron:  '0 13 * * *'
   workflow_dispatch:
     inputs:
       charts_base_branch:
         description: "Use the following rancher/charts branch as a base (e.g. dev-v2.7)"
         required: true
-        default: "dev-v2.11"
+        default: "dev-v2.14"
+        type: string
       charts_repo:
         description: "Push to the following Rancher charts repo (which must exist)"
         required: true
         default: "fleetrepoci/charts"
+        type: string
       charts_target_branch:
         description: "Use the following branch as a destination when pushing to the charts repo"
+        type: string
+  workflow_call:
+    # Variables to set when calling this reusable workflow
+    inputs:
+      charts_base_branch:
+        description: "Use the following rancher/charts branch as a base (e.g. dev-v2.7)"
+        required: true
+        default: "dev-v2.14"
+        type: string
+      charts_repo:
+        description: "Push to the following Rancher charts repo (which must exist)"
+        required: true
+        default: "fleetrepoci/charts"
+        type: string
+      charts_target_branch:
+        description: "Use the following branch as a destination when pushing to the charts repo"
+        type: string
+    outputs:
+      target_branch:
+        value: ${{ jobs.push-test-rancher-charts.outputs.target_branch }}
+      charts_repo:
+        value: ${{ jobs.push-test-rancher-charts.outputs.charts_repo }}
 
 env:
   GOARCH: amd64
@@ -34,7 +55,7 @@ jobs:
         id: compute_env
         run: |
           tmp=${{github.event.inputs.charts_base_branch}}
-          charts_base_branch=${tmp:-'dev-v2.11'}
+          charts_base_branch=${tmp:-'dev-v2.14'}
 
           tmp=${{github.event.inputs.charts_repo}}
           charts_repo=${tmp:-fleetrepoci/charts}
@@ -43,12 +64,12 @@ jobs:
           echo "charts_repo=$charts_repo" >> "$GITHUB_OUTPUT"
 
       - name: Checkout rancher/fleet
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
           path: fleet
 
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version-file: 'fleet/go.mod'
           check-latest: true
@@ -65,7 +86,7 @@ jobs:
 
       - name: Extract metadata for Fleet controller image
         id: meta-fleet
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ttl.sh/rancher-fleet-${{ steps.uuid.outputs.uuid }}
@@ -84,7 +105,7 @@ jobs:
 
       - name: Extract metadata for Fleet agent image
         id: meta-fleet-agent
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ttl.sh/rancher-fleet-agent-${{ steps.uuid.outputs.uuid }}
@@ -102,7 +123,7 @@ jobs:
           labels: ${{ steps.meta-fleet-agent.outputs.labels }}
 
       - name: Checkout test charts repo
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
           token: ${{secrets.CI_PUSH_TO_FLEETREPOCI}}
@@ -168,11 +189,3 @@ jobs:
         run: |
           cd charts
           git push -u origin ${{ steps.compute_target_branch.outputs.target_branch }}
-
-  test-fleet-in-rancher:
-    uses: ./.github/workflows/e2e-test-fleet-in-rancher.yml
-    needs: push-test-rancher-charts
-    with:
-      charts_repo: ${{ needs.push-test-rancher-charts.outputs.charts_repo }}
-      charts_branch: ${{ needs.push-test-rancher-charts.outputs.target_branch }}
-      fleet_version: 999.9.9+up9.9.9

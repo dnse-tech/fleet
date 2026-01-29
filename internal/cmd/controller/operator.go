@@ -3,22 +3,27 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/reugn/go-quartz/quartz"
 
 	"github.com/rancher/fleet/internal/cmd"
 	"github.com/rancher/fleet/internal/cmd/controller/reconciler"
 	"github.com/rancher/fleet/internal/cmd/controller/target"
+	"github.com/rancher/fleet/internal/config"
+	"github.com/rancher/fleet/internal/experimental"
 	"github.com/rancher/fleet/internal/manifest"
 	"github.com/rancher/fleet/internal/metrics"
-	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -28,7 +33,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+	utilruntime.Must(fleet.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
@@ -36,6 +41,7 @@ func start(
 	ctx context.Context,
 	systemNamespace string,
 	config *rest.Config,
+	leaderElection bool,
 	leaderOpts cmd.LeaderElectionOptions,
 	workersOpts ControllerReconcilerWorkers,
 	bindAddresses BindAddresses,
@@ -64,7 +70,7 @@ func start(
 		Metrics:                metricServerOptions,
 		HealthProbeBindAddress: bindAddresses.HealthProbe,
 
-		LeaderElection:          true,
+		LeaderElection:          leaderElection,
 		LeaderElectionID:        fmt.Sprintf("fleet-controller-leader-election-shard%s", leaderElectionSuffix),
 		LeaderElectionNamespace: systemNamespace,
 		LeaseDuration:           &leaderOpts.LeaseDuration,
@@ -105,9 +111,14 @@ func start(
 		return err
 	}
 
+	var shardIDSuffix string
+	if shardID != "" {
+		shardIDSuffix = fmt.Sprintf("-%s", shardID)
+	}
 	if err = (&reconciler.BundleReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor(fmt.Sprintf("fleet-bundle-ctrl%s", shardIDSuffix)),
 
 		Builder: builder,
 		Store:   store,
@@ -162,6 +173,42 @@ func start(
 		return err
 	}
 
+	if experimental.SchedulesEnabled() {
+		if err = (&reconciler.ScheduleReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor(fmt.Sprintf("fleet-schedule-ctrl%s", shardIDSuffix)),
+			ShardID:  shardID,
+
+			Workers:   workersOpts.Schedule,
+			Scheduler: sched,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Schedule")
+			return err
+		}
+	}
+
+	// Add an indexer for the ContentName label as that will make accesses in the cache
+	// faster
+	if err := AddContentNameLabelIndexer(ctx, mgr); err != nil {
+		return err
+	}
+
+	// Add an indexer for Bundle DownstreamResources (secrets and configmaps)
+	if err := AddBundleDownstreamResourceIndexer(ctx, mgr); err != nil {
+		return err
+	}
+
+	if err = (&reconciler.ContentReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		ShardID: shardID,
+		Workers: workersOpts.Content,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Content")
+		return err
+	}
+
 	//+kubebuilder:scaffold:builder
 
 	if err := reconciler.Load(ctx, mgr.GetAPIReader(), systemNamespace); err != nil {
@@ -193,4 +240,50 @@ func start(
 	sched.Stop()
 
 	return nil
+}
+
+func AddContentNameLabelIndexer(ctx context.Context, mgr manager.Manager) error {
+	return mgr.GetFieldIndexer().IndexField(
+		ctx,
+		&fleet.BundleDeployment{},
+		config.ContentNameIndex,
+		func(obj client.Object) []string {
+			content, ok := obj.(*fleet.BundleDeployment)
+			if !ok {
+				return nil
+			}
+			if val, exists := content.Labels[fleet.ContentNameLabel]; exists {
+				return []string{val}
+			}
+			return nil
+		},
+	)
+}
+
+// AddBundleDownstreamResourceIndexer indexes Bundles by their DownstreamResources (secrets and configmaps).
+// This allows querying which bundles reference a specific secret or configmap, enabling reconciliation
+// when those resources change.
+func AddBundleDownstreamResourceIndexer(ctx context.Context, mgr manager.Manager) error {
+	return mgr.GetFieldIndexer().IndexField(
+		ctx,
+		&fleet.Bundle{},
+		config.BundleDownstreamResourceIndex,
+		func(obj client.Object) []string {
+			bundle, ok := obj.(*fleet.Bundle)
+			if !ok {
+				return nil
+			}
+
+			// Extract all downstream resource names (secrets and configmaps)
+			var resources []string
+			for _, dr := range bundle.Spec.DownstreamResources {
+				lowerKind := strings.ToLower(dr.Kind)
+				if lowerKind == "secret" || lowerKind == "configmap" {
+					// Index by "Kind/Name" to uniquely identify the resource
+					resources = append(resources, fmt.Sprintf("%s/%s", lowerKind, dr.Name))
+				}
+			}
+			return resources
+		},
+	)
 }

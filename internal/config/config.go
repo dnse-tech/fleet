@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	corev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -44,6 +45,22 @@ const (
 
 	// Default secret name for git credentials, used as a fallback if no secret is referenced by an app.
 	DefaultGitCredentialsSecretName = "gitcredential" //nolint:gosec // this is a resource name
+
+	// Default secret name for oci storage,
+	// used as a fallback if no secret is specified by the user in the GitRepo.
+	DefaultOCIStorageSecretName = "ocistorage"
+
+	// ContentNameIndex is the name of the index for the content name label in bundle deployments
+	ContentNameIndex = "metadata.labels." + fleet.ContentNameLabel
+
+	// RepoNameIndex is the name of the index for the gitrepo name in bundles
+	RepoNameIndex = "metadata.labels." + fleet.RepoLabel
+
+	// ImageScanGitRepoIndex is the name of the index for the gitrepo name in imagescans
+	ImageScanGitRepoIndex = "spec.gitrepoName"
+
+	// BundleDownstreamResourceIndex is the name of the index for downstream resources (secrets and configmaps) in bundles
+	BundleDownstreamResourceIndex = "spec.downstreamResources"
 )
 
 var (
@@ -132,8 +149,9 @@ type AgentWorkers struct {
 }
 
 type Bootstrap struct {
-	Namespace      string `json:"namespace,omitempty"`
-	AgentNamespace string `json:"agentNamespace,omitempty"`
+	Namespace      string            `json:"namespace,omitempty"`
+	AgentNamespace string            `json:"agentNamespace,omitempty"`
+	ClusterLabels  map[string]string `json:"clusterLabels,omitempty"`
 	// Repo to add at install time that will deploy to the local cluster. This allows
 	// one to fully bootstrap fleet, its configuration and all its downstream clusters
 	// in one shot.

@@ -11,8 +11,9 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	fleetcli "github.com/rancher/fleet/internal/cmd/cli"
+	fleetapply "github.com/rancher/fleet/internal/cmd/cli/apply"
 	"github.com/rancher/fleet/internal/config"
+	fleetgithub "github.com/rancher/fleet/internal/github"
 	"github.com/rancher/fleet/internal/names"
 	"github.com/rancher/fleet/internal/ocistorage"
 	ssh "github.com/rancher/fleet/internal/ssh"
@@ -28,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -45,6 +47,12 @@ const (
 
 	bundleOptionsSeparatorChars = ":,|?<>"
 )
+
+type helmSecretOptions struct {
+	HasCACerts      bool
+	InsecureSkipTLS bool
+	BasicHTTP       bool
+}
 
 func (r *GitJobReconciler) createJobAndResources(ctx context.Context, gitrepo *v1alpha1.GitRepo, logger logr.Logger) error {
 	logger.V(1).Info("Creating Git job resources")
@@ -115,20 +123,44 @@ func (r *GitJobReconciler) createCABundleSecret(ctx context.Context, gitrepo *v1
 			Namespace: gitrepo.Namespace,
 			Name:      name,
 		},
-		Data: map[string][]byte{
-			fieldName: caBundle,
-		},
 	}
-	if err := controllerutil.SetControllerReference(gitrepo, secret, r.Scheme); err != nil {
-		return false, err
-	}
-	data := secret.StringData
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
-		secret.StringData = data // Supports update case, if the secret already exists.
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations["revision"] = strconv.FormatInt(time.Now().Unix(), 10)
+		secret.Data = map[string][]byte{
+			fieldName: caBundle,
+		}
+		if err := controllerutil.SetControllerReference(gitrepo, secret, r.Scheme); err != nil {
+			return err
+		}
 		return nil
 	})
+	if err != nil {
+		return false, err
+	}
 
-	return true, err
+	updatedSecret := &corev1.Secret{}
+	err = retry.OnError(retry.DefaultRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		if err := r.Get(ctx, types.NamespacedName{
+			Namespace: gitrepo.Namespace,
+			Name:      name,
+		}, updatedSecret); err != nil {
+			return err
+		}
+		if !strings.EqualFold(updatedSecret.Annotations["revision"], secret.Annotations["revision"]) {
+			return fmt.Errorf("CA bundle secret %s/%s has not been synced in time before git job creation", gitrepo.Namespace, name)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (r *GitJobReconciler) createJob(ctx context.Context, gitRepo *v1alpha1.GitRepo) error {
@@ -327,29 +359,33 @@ func (r *GitJobReconciler) newJobSpec(ctx context.Context, gitrepo *v1alpha1.Git
 
 	volumes, volumeMounts := volumes(configMap.Name)
 	var certVolCreated bool
+	var helmInsecure bool
+	var helmBasicHTTP bool
 
 	if gitrepo.Spec.HelmSecretNameForPaths != "" {
-		vols, volMnts, hasCertVol := volumesFromSecret(ctx, r.Client,
+		vols, volMnts, helmSecretOpts := volumesFromSecret(ctx, r.Client,
 			gitrepo.Namespace,
 			gitrepo.Spec.HelmSecretNameForPaths,
 			"helm-secret-by-path",
 			"",
 		)
 
-		certVolCreated = hasCertVol
+		certVolCreated = helmSecretOpts.HasCACerts
 
 		volumes = append(volumes, vols...)
 		volumeMounts = append(volumeMounts, volMnts...)
 
 	} else if gitrepo.Spec.HelmSecretName != "" {
-		vols, volMnts, hasCertVol := volumesFromSecret(ctx, r.Client,
+		vols, volMnts, helmSecretOpts := volumesFromSecret(ctx, r.Client,
 			gitrepo.Namespace,
 			gitrepo.Spec.HelmSecretName,
 			"helm-secret",
 			"",
 		)
 
-		certVolCreated = hasCertVol
+		certVolCreated = helmSecretOpts.HasCACerts
+		helmInsecure = helmSecretOpts.InsecureSkipTLS
+		helmBasicHTTP = helmSecretOpts.BasicHTTP
 
 		volumes = append(volumes, vols...)
 		volumeMounts = append(volumeMounts, volMnts...)
@@ -402,7 +438,9 @@ func (r *GitJobReconciler) newJobSpec(ctx context.Context, gitrepo *v1alpha1.Git
 
 	saName := names.SafeConcatName("git", gitrepo.Name)
 	logger := log.FromContext(ctx)
-	args, envs := argsAndEnvs(gitrepo, logger, CACertsFilePathOverride, r.KnownHosts, drivenScanSeparator)
+	args, envs := argsAndEnvs(gitrepo, logger, CACertsFilePathOverride, r.KnownHosts, drivenScanSeparator, helmInsecure, helmBasicHTTP)
+
+	zero := int32(0)
 
 	return &batchv1.JobSpec{
 		BackoffLimit: &zero,
@@ -476,11 +514,12 @@ func (r *GitJobReconciler) newGitCloner(
 	}
 
 	branch, rev := obj.Spec.Branch, obj.Spec.Revision
-	if branch != "" {
+	switch {
+	case branch != "":
 		args = append(args, "--branch", branch)
-	} else if rev != "" {
+	case rev != "":
 		args = append(args, "--revision", rev)
-	} else {
+	default:
 		args = append(args, "--branch", "master")
 	}
 
@@ -516,6 +555,20 @@ func (r *GitJobReconciler) newGitCloner(
 				MountPath: "/gitjob/ssh",
 			})
 			args = append(args, "--ssh-private-key-file", "/gitjob/ssh/"+corev1.SSHAuthPrivateKey)
+		default:
+			if fleetgithub.HasGitHubAppKeys(&secret) {
+				volumeMounts = append(volumeMounts, corev1.VolumeMount{
+					Name:      gitCredentialVolumeName,
+					MountPath: "/gitjob/githubapp",
+				})
+				args = append(args,
+					"--github-app-id", string(secret.Data[fleetgithub.GithubAppIDKey]),
+					"--github-app-installation-id", string(secret.Data[fleetgithub.GithubAppInstallationIDKey]),
+					"--github-app-key-file", "/gitjob/githubapp/"+fleetgithub.GithubAppPrivateKeyKey,
+				)
+			} else {
+				return corev1.Container{}, fmt.Errorf("missing Github App keys in secret %s/%s", secret.Namespace, secret.Name)
+			}
 		}
 	}
 
@@ -542,7 +595,7 @@ func (r *GitJobReconciler) newGitCloner(
 
 	env := []corev1.EnvVar{
 		{
-			Name:  fleetcli.JSONOutputEnvVar,
+			Name:  fleetapply.JSONOutputEnvVar,
 			Value: "true",
 		},
 	}
@@ -576,12 +629,24 @@ func (r *GitJobReconciler) newGitCloner(
 	}, nil
 }
 
+// readIntEnvVar reads an integer from an environment variable using the provided getter function.
+// If an error occurs, it logs the error and returns the default value.
+func readIntEnvVar(logger logr.Logger, getter func() (int, error), envVarName string) int {
+	val, err := getter()
+	if err != nil {
+		logger.Error(err, "failed parsing env variable, using defaults", "env_var_name", envVarName)
+	}
+	return val
+}
+
 func argsAndEnvs(
 	gitrepo *v1alpha1.GitRepo,
 	logger logr.Logger,
-	CACertsPathOverride string,
+	pathOverrideCACerts string,
 	knownHosts KnownHostsGetter,
 	drivenScanSeparator string,
+	helmInsecureSkipTLS bool,
+	helmBasicHTTP bool,
 ) ([]string, []corev1.EnvVar) {
 	args := []string{
 		"fleet",
@@ -624,22 +689,29 @@ func argsAndEnvs(
 		}
 	}
 
-	fleetApplyRetries, err := fleetcli.GetOnConflictRetries()
-	if err != nil {
-		logger.Error(err, "failed parsing env variable, using defaults", "env_var_name", fleetcli.FleetApplyConflictRetriesEnv)
-	}
+	fleetApplyRetries := readIntEnvVar(logger, fleetapply.GetOnConflictRetries, fleetapply.FleetApplyConflictRetriesEnv)
+	bundleCreationMaxConcurrency := readIntEnvVar(logger, fleetapply.GetBundleCreationMaxConcurrency, fleetapply.BundleCreationMaxConcurrencyEnv)
+
 	env := []corev1.EnvVar{
 		{
 			Name:  "HOME",
 			Value: fleetHomeDir,
 		},
 		{
-			Name:  fleetcli.JSONOutputEnvVar,
+			Name:  fleetapply.JSONOutputEnvVar,
 			Value: "true",
 		},
 		{
-			Name:  fleetcli.FleetApplyConflictRetriesEnv,
+			Name:  fleetapply.JobNameEnvVar,
+			Value: jobName(gitrepo),
+		},
+		{
+			Name:  fleetapply.FleetApplyConflictRetriesEnv,
 			Value: strconv.Itoa(fleetApplyRetries),
+		},
+		{
+			Name:  fleetapply.BundleCreationMaxConcurrencyEnv,
+			Value: strconv.Itoa(bundleCreationMaxConcurrency),
 		},
 	}
 
@@ -660,7 +732,7 @@ func argsAndEnvs(
 			"/etc/fleet/helm/ssh-privatekey",
 		}
 
-		if CACertsPathOverride == "" {
+		if pathOverrideCACerts == "" {
 			helmArgs = append(helmArgs,
 				"--cacerts-file",
 				"/etc/fleet/helm/cacerts",
@@ -688,10 +760,10 @@ func argsAndEnvs(
 			})
 	}
 
-	if CACertsPathOverride != "" {
+	if pathOverrideCACerts != "" {
 		helmArgs := []string{
 			"--cacerts-file",
-			CACertsPathOverride,
+			pathOverrideCACerts,
 		}
 		if gitrepo.Spec.HelmRepoURLRegex != "" {
 			helmArgs = append(helmArgs, "--helm-repo-url-regex", gitrepo.Spec.HelmRepoURLRegex)
@@ -700,12 +772,13 @@ func argsAndEnvs(
 		env = append(env, gitSSHCommandEnvVar(knownHosts.IsStrict()))
 	}
 
-	if ocistorage.ExperimentalOCIIsEnabled() {
+	if !ocistorage.OCIIsEnabled() {
 		env = append(env,
 			corev1.EnvVar{
-				Name:  "EXPERIMENTAL_OCI_STORAGE",
-				Value: "true",
+				Name:  ocistorage.OCIStorageFlag,
+				Value: "false",
 			})
+	} else {
 		args = append(args, "--oci-registry-secret", gitrepo.Spec.OCIRegistrySecret)
 	}
 
@@ -714,6 +787,13 @@ func argsAndEnvs(
 		if drivenScanSeparator != "" {
 			args = append(args, "--driven-scan-sep", drivenScanSeparator)
 		}
+	}
+
+	if helmInsecureSkipTLS {
+		args = append(args, "--helm-insecure-skip-tls")
+	}
+	if helmBasicHTTP {
+		args = append(args, "--helm-basic-http")
 	}
 
 	return append(args, "--", gitrepo.Name), env
@@ -772,12 +852,15 @@ func volumes(targetsConfigName string) ([]corev1.Volume, []corev1.VolumeMount) {
 
 // volumesFromSecret generates volumes and volume mounts from a Helm secret, assuming that that secret exists.
 // If the secret has a cacerts key, it will be mounted into /etc/ssl/certs, too.
+// It also returns a struct containing boolean values indicating if a volume has
+// been created for CA bundles, along with values (defaulting to false) of the
+// `insecureSkipVerify` and `basicHTTP` keys of the secret.
 func volumesFromSecret(
 	ctx context.Context,
 	c client.Client,
 	namespace string,
 	secretName, volumeName, mountPath string,
-) ([]corev1.Volume, []corev1.VolumeMount, bool) {
+) ([]corev1.Volume, []corev1.VolumeMount, helmSecretOptions) {
 	if mountPath == "" {
 		mountPath = "/etc/fleet/helm"
 	}
@@ -827,7 +910,32 @@ func volumesFromSecret(
 		certVolCreated = true
 	}
 
-	return volumes, volumeMounts, certVolCreated
+	// Get the values for skipping TLS and basic HTTP connections.
+	// In case of error reading the values they will be considered
+	// as set to false as those values are security related.
+	insecureSkipVerify := false
+	if value, ok := secret.Data["insecureSkipVerify"]; ok {
+		boolValue, err := strconv.ParseBool(string(value))
+		if err == nil {
+			insecureSkipVerify = boolValue
+		}
+	}
+
+	basicHTTP := false
+	if value, ok := secret.Data["basicHTTP"]; ok {
+		boolValue, err := strconv.ParseBool(string(value))
+		if err == nil {
+			basicHTTP = boolValue
+		}
+	}
+
+	secretOpts := helmSecretOptions{
+		InsecureSkipTLS: insecureSkipVerify,
+		BasicHTTP:       basicHTTP,
+		HasCACerts:      certVolCreated,
+	}
+
+	return volumes, volumeMounts, secretOpts
 }
 
 func proxyEnvVars() []corev1.EnvVar {

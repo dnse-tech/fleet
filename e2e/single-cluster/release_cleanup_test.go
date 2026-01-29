@@ -1,6 +1,7 @@
 package singlecluster_test
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os/exec"
@@ -46,11 +47,9 @@ var _ = Describe("Monitoring Helm releases along bundle namespace updates", Orde
 		out, err := k.Delete("bundle", bundleName)
 		Expect(err).ToNot(HaveOccurred(), out)
 
-		out, err = k.Delete("ns", oldNamespace, "--wait=false")
-		Expect(err).ToNot(HaveOccurred(), out)
+		_, _ = k.Delete("ns", oldNamespace, "--wait=false")
 
-		out, err = k.Delete("ns", newNamespace, "--wait=false")
-		Expect(err).ToNot(HaveOccurred(), out)
+		_, _ = k.Delete("ns", newNamespace, "--wait=false")
 	})
 
 	When("updating a bundle's namespace", func() {
@@ -171,7 +170,7 @@ var _ = Describe("Monitoring Helm releases along bundle release name updates", O
 func checkRelease(namespace, releaseName string) {
 	var releases []string
 	Eventually(func(g Gomega) {
-		cmd := exec.Command("helm", "list", "-q", "-n", namespace)
+		cmd := exec.CommandContext(context.Background(), "helm", "list", "-q", "-n", namespace)
 		out, err := cmd.CombinedOutput()
 		g.Expect(err).ToNot(HaveOccurred())
 		g.Expect(string(out)).ToNot(BeEmpty())

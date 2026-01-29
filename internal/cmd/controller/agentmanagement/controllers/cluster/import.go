@@ -11,6 +11,7 @@ import (
 	"os"
 
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/rancher/fleet/internal/client"
 	"github.com/rancher/fleet/internal/cmd"
@@ -18,6 +19,7 @@ import (
 	"github.com/rancher/fleet/internal/cmd/controller/agentmanagement/agent"
 	"github.com/rancher/fleet/internal/cmd/controller/agentmanagement/connection"
 	"github.com/rancher/fleet/internal/cmd/controller/agentmanagement/controllers/manageagent"
+	"github.com/rancher/fleet/internal/cmd/controller/agentmanagement/scheduling"
 	fleetns "github.com/rancher/fleet/internal/cmd/controller/namespace"
 	"github.com/rancher/fleet/internal/config"
 	"github.com/rancher/fleet/internal/names"
@@ -33,21 +35,30 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/utils/ptr"
 )
 
+const (
+	// clusterForKubeconfigSecretIndexer indexes Clusters by the key of the kubeconfig secret they reference in their spec
+	clusterForKubeconfigSecretIndexer = "agentmanagement.fleet.cattle.io/cluster-for-kubeconfig"
+)
+
 var (
 	ImportTokenPrefix = "import-token-"
+
+	errUnavailableAPIServerURL = errors.New("missing apiServerURL in fleet config for cluster auto registration")
 )
 
 type importHandler struct {
 	ctx                 context.Context
 	systemNamespace     string
-	secrets             corecontrollers.SecretCache
 	clusters            fleetcontrollers.ClusterController
+	clustersCache       fleetcontrollers.ClusterCache
+	secretsCache        corecontrollers.SecretCache
 	tokens              fleetcontrollers.ClusterRegistrationTokenCache
 	tokenClient         fleetcontrollers.ClusterRegistrationTokenClient
 	bundleClient        fleetcontrollers.BundleClient
@@ -57,7 +68,7 @@ type importHandler struct {
 func RegisterImport(
 	ctx context.Context,
 	systemNamespace string,
-	secrets corecontrollers.SecretCache,
+	secrets corecontrollers.SecretController,
 	clusters fleetcontrollers.ClusterController,
 	tokens fleetcontrollers.ClusterRegistrationTokenController,
 	bundles fleetcontrollers.BundleClient,
@@ -66,8 +77,9 @@ func RegisterImport(
 	h := importHandler{
 		ctx:                 ctx,
 		systemNamespace:     systemNamespace,
-		secrets:             secrets,
 		clusters:            clusters,
+		clustersCache:       clusters.Cache(),
+		secretsCache:        secrets.Cache(),
 		tokens:              tokens.Cache(),
 		tokenClient:         tokens,
 		namespaceController: namespaceController,
@@ -77,6 +89,30 @@ func RegisterImport(
 	clusters.OnChange(ctx, "import-cluster", h.OnChange)
 	fleetcontrollers.RegisterClusterStatusHandler(ctx, clusters, "Imported", "import-cluster", h.importCluster)
 	config.OnChange(ctx, h.onConfig)
+
+	clustersCache := clusters.Cache()
+	clustersCache.AddIndexer(clusterForKubeconfigSecretIndexer, func(cluster *fleet.Cluster) ([]string, error) {
+		if cluster == nil || len(cluster.Spec.KubeConfigSecret) == 0 {
+			return []string{}, nil
+		}
+		secretKey := getKubeConfigSecretNS(cluster) + "/" + cluster.Spec.KubeConfigSecret
+		return []string{secretKey}, nil
+	})
+	secrets.OnChange(ctx, "kubeconfig-secrets-watch", func(key string, secret *corev1.Secret) (*corev1.Secret, error) {
+		clusters, err := clustersCache.GetByIndex(clusterForKubeconfigSecretIndexer, key)
+		if err != nil {
+			return nil, err
+		}
+		cfg := config.Get()
+		for _, cluster := range clusters {
+			if err := h.checkForConfigChange(cfg, cluster, secret); err != nil {
+				logrus.WithError(err).Errorf("cluster %s/%s: could not check for config changes", cluster.Namespace, cluster.Name)
+			}
+		}
+		// Successfully checked all clusters for config changes. No secret modification needed,
+		// and no error occurred. The secret watcher processed the event successfully.
+		return nil, nil
+	})
 }
 
 // onConfig triggers clusters which rely on the fallback config in the
@@ -84,40 +120,31 @@ func RegisterImport(
 // and apiServerCA, as they are needed e.g. to update the fleet-agent-bootstrap
 // secret.
 func (i *importHandler) onConfig(cfg *config.Config) error {
-	clusters, err := i.clusters.List("", metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-
-	if len(clusters.Items) == 0 {
-		return nil
-	}
-
 	if cfg == nil {
 		return errors.New("config is nil: this should never happen")
 	}
 
-	for _, cluster := range clusters.Items {
+	clusters, err := i.clustersCache.List(metav1.NamespaceAll, labels.Everything())
+	if err != nil {
+		return err
+	}
+
+	if len(clusters) == 0 {
+		return nil
+	}
+
+	for _, cluster := range clusters {
 		if cluster.Spec.KubeConfigSecret == "" {
 			continue
 		}
 
-		hasConfigChanged, err := i.hasAPIServerConfigChanged(cfg, cluster)
+		secret, err := i.secretsCache.Get(getKubeConfigSecretNS(cluster), cluster.Spec.KubeConfigSecret)
 		if err != nil {
-			return fmt.Errorf("cluster %s/%s: could not check for config changes: %v", cluster.Namespace, cluster.Name, err)
+			return fmt.Errorf("cluster %s/%s: could not check for config changes: %w", cluster.Namespace, cluster.Name, err)
 		}
-
-		hasConfigChanged = hasConfigChanged || cfg.AgentTLSMode != cluster.Status.AgentTLSMode ||
-			hasGarbageCollectionIntervalChanged(cfg, cluster)
-
-		if hasConfigChanged {
-			logrus.Infof("API server config changed, trigger cluster import for cluster %s/%s", cluster.Namespace, cluster.Name)
-			c := cluster.DeepCopy()
-			c.Status.AgentConfigChanged = true
-			_, err := i.clusters.UpdateStatus(c)
-			if err != nil {
-				return err
-			}
+		if err := i.checkForConfigChange(cfg, cluster, secret); err != nil {
+			logrus.WithError(err).Warnf("cluster %s/%s: could not check for config changes", cluster.Namespace, cluster.Name)
+			continue
 		}
 	}
 	return nil
@@ -128,21 +155,15 @@ func (i *importHandler) onConfig(cfg *config.Config) error {
 // server URL and CA are understood to be sourced from there, hence config changes for those fields will be skipped.
 // Returns a boolean indicating whether URL or CA config has changed, and any error that may have occurred (such as the
 // referenced secret not being found).
-func (i *importHandler) hasAPIServerConfigChanged(cfg *config.Config, cluster fleet.Cluster) (bool, error) {
-	kubeConfigSecretNamespace := getKubeConfigSecretNS(cluster)
-
+func (i *importHandler) hasAPIServerConfigChanged(cfg *config.Config, secret *corev1.Secret, cluster *fleet.Cluster) (bool, error) {
 	var secretAPIServerCA, secretAPIServerURL []byte
-	var secret *corev1.Secret
-
-	if cluster.Spec.KubeConfigSecret != "" {
-		var err error
-		secret, err = i.secrets.Get(kubeConfigSecretNamespace, cluster.Spec.KubeConfigSecret)
-		if err != nil {
-			return false, err
-		}
-
+	if secret != nil {
 		secretAPIServerURL = secret.Data[config.APIServerURLKey]
 		secretAPIServerCA = secret.Data[config.APIServerCAKey]
+	}
+
+	if len(secretAPIServerURL) == 0 && len(cfg.APIServerURL) == 0 {
+		return false, errUnavailableAPIServerURL
 	}
 
 	// if the API server URL is non-empty in the secret, then it is sourced from there; config changes for that field
@@ -204,6 +225,7 @@ func (i *importHandler) OnChange(key string, cluster *fleet.Cluster) (_ *fleet.C
 		return cluster, nil
 	}
 
+	// cluster.spec.KubeConfigSecret is empty when agent-initiated registration is used
 	if cluster.Spec.KubeConfigSecret == "" || agentDeployed(cluster) {
 		return cluster, nil
 	}
@@ -248,6 +270,12 @@ func (i *importHandler) deleteOldAgent(cluster *fleet.Cluster, kc kubernetes.Int
 	if err := kc.AppsV1().Deployments(namespace).Delete(i.ctx, config.AgentConfigName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
+	if err := kc.SchedulingV1().PriorityClasses().Delete(i.ctx, scheduling.FleetAgentPriorityClassName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	if err := kc.PolicyV1().PodDisruptionBudgets(namespace).Delete(i.ctx, scheduling.FleetAgentPodDisruptionBudgetName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
 
 	logrus.Infof("Deleted old agent for cluster (%s/%s) in namespace %s", cluster.Namespace, cluster.Name, namespace)
 
@@ -256,7 +284,9 @@ func (i *importHandler) deleteOldAgent(cluster *fleet.Cluster, kc kubernetes.Int
 
 // importCluster is triggered for manager initiated deployments and the local agent, It re-deploys the agent on the downstream cluster.
 // Since it re-creates the fleet-agent-bootstrap secret, it will also re-register the agent.
-func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.ClusterStatus) (_ fleet.ClusterStatus, err error) {
+//
+//nolint:gocyclo
+func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.ClusterStatus) (fleet.ClusterStatus, error) {
 	if manageagent.SkipCluster(cluster) {
 		return status, nil
 	}
@@ -272,11 +302,11 @@ func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.Clust
 		return status, nil
 	}
 
-	kubeConfigSecretNamespace := getKubeConfigSecretNS(*cluster)
+	kubeConfigSecretNamespace := getKubeConfigSecretNS(cluster)
 
 	logrus.Debugf("Cluster import for '%s/%s'. Getting kubeconfig from secret in namespace %s", cluster.Namespace, cluster.Name, kubeConfigSecretNamespace)
 
-	secret, err := i.secrets.Get(kubeConfigSecretNamespace, cluster.Spec.KubeConfigSecret)
+	secret, err := i.secretsCache.Get(kubeConfigSecretNamespace, cluster.Spec.KubeConfigSecret)
 	if err != nil {
 		return status, err
 	}
@@ -290,7 +320,10 @@ func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.Clust
 
 	if apiServerURL == "" {
 		if len(cfg.APIServerURL) == 0 {
-			return status, fmt.Errorf("missing apiServerURL in fleet config for cluster auto registration")
+			// Current config cannot be deployed, so remove the "config changed" mark
+			logrus.Warnf("cannot import cluster '%s/%s', missing apiServerURL in fleet config for cluster auto registration", cluster.Namespace, cluster.Name)
+			status.AgentConfigChanged = false
+			return status, nil
 		}
 		logrus.Debugf("Cluster import for '%s/%s'. Using apiServerURL from fleet-controller config", cluster.Namespace, cluster.Name)
 		apiServerURL = cfg.APIServerURL
@@ -326,8 +359,8 @@ func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.Clust
 	tokenName := names.SafeConcatName(ImportTokenPrefix + cluster.Name)
 	token, err := i.tokens.Get(cluster.Namespace, tokenName)
 	if err != nil {
-		// ignore error
-		_, err = i.tokenClient.Create(&fleet.ClusterRegistrationToken{
+		// If token doesn't exist, try to create it
+		token, err = i.tokenClient.Create(&fleet.ClusterRegistrationToken{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: cluster.Namespace,
 				Name:      tokenName,
@@ -344,9 +377,21 @@ func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.Clust
 				TTL: &metav1.Duration{Duration: durations.ClusterImportTokenTTL},
 			},
 		})
-		logrus.Debugf("Failed to create ClusterRegistrationToken for cluster %s/%s: %v (requeuing)", cluster.Namespace, cluster.Name, err)
-		i.clusters.EnqueueAfter(cluster.Namespace, cluster.Name, durations.TokenClusterEnqueueDelay)
-		return status, nil
+		// Ignore AlreadyExists errors (race condition with another reconcile)
+		if err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				token, err = i.tokens.Get(cluster.Namespace, tokenName)
+				if err != nil {
+					logrus.Debugf("Failed to get existing ClusterRegistrationToken for cluster %s/%s: %v (requeuing)", cluster.Namespace, cluster.Name, err)
+					i.clusters.EnqueueAfter(cluster.Namespace, cluster.Name, durations.TokenClusterEnqueueDelay)
+					return status, err
+				}
+			} else {
+				logrus.Debugf("Failed to create ClusterRegistrationToken for cluster %s/%s: %v (requeuing)", cluster.Namespace, cluster.Name, err)
+				i.clusters.EnqueueAfter(cluster.Namespace, cluster.Name, durations.TokenClusterEnqueueDelay)
+				return status, err
+			}
+		}
 	}
 
 	agentNamespace := i.systemNamespace
@@ -357,9 +402,28 @@ func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.Clust
 	clusterLabels := yaml.CleanAnnotationsForExport(cluster.Labels)
 	agentReplicas := cmd.ParseEnvAgentReplicaCount()
 
+	var (
+		objs              []runtime.Object
+		priorityClassName string
+	)
+	if sc := cluster.Spec.AgentSchedulingCustomization; sc != nil {
+		if sc.PriorityClass != nil {
+			priorityClassName = scheduling.FleetAgentPriorityClassName
+			objs = append(objs, scheduling.PriorityClass(sc.PriorityClass))
+		}
+
+		if sc.PodDisruptionBudget != nil {
+			pdb, err := scheduling.PodDisruptionBudget(agentNamespace, sc.PodDisruptionBudget)
+			if err != nil {
+				return status, err
+			}
+			objs = append(objs, pdb)
+		}
+	}
+
 	// Notice we only set the agentScope when it's a non-default agentNamespace. This is for backwards compatibility
 	// for when we didn't have agent scope before
-	objs, err := agent.AgentWithConfig(
+	agentObjs, err := agent.AgentWithConfig(
 		i.ctx, agentNamespace, i.systemNamespace,
 		cluster.Spec.AgentNamespace,
 		&client.Getter{Namespace: cluster.Namespace},
@@ -375,15 +439,17 @@ func (i *importHandler) importCluster(cluster *fleet.Cluster, status fleet.Clust
 			},
 			// keep in sync with manageagent.go
 			ManifestOptions: agent.ManifestOptions{
-				AgentEnvVars:     cluster.Spec.AgentEnvVars,
-				AgentTolerations: cluster.Spec.AgentTolerations,
-				PrivateRepoURL:   cluster.Spec.PrivateRepoURL,
-				AgentAffinity:    cluster.Spec.AgentAffinity,
-				AgentResources:   cluster.Spec.AgentResources,
-				HostNetwork:      *cmp.Or(cluster.Spec.HostNetwork, ptr.To(false)),
-				AgentReplicas:    agentReplicas,
+				AgentEnvVars:      cluster.Spec.AgentEnvVars,
+				AgentTolerations:  cluster.Spec.AgentTolerations,
+				PrivateRepoURL:    cluster.Spec.PrivateRepoURL,
+				AgentAffinity:     cluster.Spec.AgentAffinity,
+				AgentResources:    cluster.Spec.AgentResources,
+				HostNetwork:       *cmp.Or(cluster.Spec.HostNetwork, ptr.To(false)),
+				AgentReplicas:     agentReplicas,
+				PriorityClassName: priorityClassName,
 			},
 		})
+	objs = append(objs, agentObjs...)
 	if err != nil {
 		return status, err
 	}
@@ -481,8 +547,12 @@ func (i *importHandler) restConfigFromKubeConfig(data []byte, agentTLSMode strin
 	if agentTLSMode == config.AgentTLSModeSystemStore && raw.Contexts[raw.CurrentContext] != nil {
 		cluster := raw.Contexts[raw.CurrentContext].Cluster
 		if raw.Clusters[cluster] != nil {
-			if _, err := http.Get(raw.Clusters[cluster].Server); err == nil {
-				raw.Clusters[cluster].CertificateAuthorityData = nil
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, raw.Clusters[cluster].Server, nil)
+			if err == nil {
+				if resp, err := http.DefaultClient.Do(req); err == nil {
+					resp.Body.Close()
+					raw.Clusters[cluster].CertificateAuthorityData = nil
+				}
 			}
 		}
 	}
@@ -490,7 +560,37 @@ func (i *importHandler) restConfigFromKubeConfig(data []byte, agentTLSMode strin
 	return clientcmd.NewDefaultClientConfig(raw, &clientcmd.ConfigOverrides{}).ClientConfig()
 }
 
-func getKubeConfigSecretNS(cluster fleet.Cluster) string {
+func (i *importHandler) checkForConfigChange(cfg *config.Config, cluster *fleet.Cluster, secret *corev1.Secret) error {
+	// Already marked for attempting to import
+	if cluster.Status.AgentConfigChanged {
+		return nil
+	}
+
+	apiServerConfigChanged, err := i.hasAPIServerConfigChanged(cfg, secret, cluster)
+	if err != nil {
+		if errors.Is(err, errUnavailableAPIServerURL) {
+			// skip the rest of checks
+			logrus.WithError(err).Warnf("cluster %s/%s: could not check for config changes", cluster.Namespace, cluster.Name)
+			return nil
+		}
+		return err
+	}
+	hasConfigChanged := apiServerConfigChanged ||
+		cfg.AgentTLSMode != cluster.Status.AgentTLSMode ||
+		hasGarbageCollectionIntervalChanged(cfg, cluster)
+
+	if !hasConfigChanged {
+		return nil
+	}
+
+	logrus.Infof("API server config changed, trigger cluster import for cluster %s/%s", cluster.Namespace, cluster.Name)
+	c := cluster.DeepCopy()
+	c.Status.AgentConfigChanged = true
+	_, err = i.clusters.UpdateStatus(c)
+	return err
+}
+
+func getKubeConfigSecretNS(cluster *fleet.Cluster) string {
 	if cluster.Spec.KubeConfigSecretNamespace == "" {
 		return cluster.Namespace
 	}
@@ -498,7 +598,7 @@ func getKubeConfigSecretNS(cluster fleet.Cluster) string {
 	return cluster.Spec.KubeConfigSecretNamespace
 }
 
-func hasGarbageCollectionIntervalChanged(config *config.Config, cluster fleet.Cluster) bool {
+func hasGarbageCollectionIntervalChanged(config *config.Config, cluster *fleet.Cluster) bool {
 	return (config.GarbageCollectionInterval.Duration != 0 && cluster.Status.GarbageCollectionInterval == nil) ||
 		(cluster.Status.GarbageCollectionInterval != nil &&
 			config.GarbageCollectionInterval.Duration != cluster.Status.GarbageCollectionInterval.Duration)

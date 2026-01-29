@@ -13,19 +13,19 @@ on:
         # k3d version list k3s | sed 's/+/-/' | sort -h
         description: "K3s version to use"
         required: true
-        default: "v1.33.1-k3s1"
+        default: "v1.34.1-k3s1"
       rancher_version:
         description: "Rancher version to install"
         required: true
-        default: "2.10.3"
+        default: "2.12.0"
       fleet_crd_url:
         description: "Fleet CRD chart URL from rancher/charts"
         required: true
-        default: https://github.com/rancher/charts/raw/dev-v2.9/assets/fleet-crd/fleet-crd-104.0.0+up0.10.0-rc.4.tgz
+        default: https://github.com/rancher/charts/raw/dev-v2.12/assets/fleet-crd/fleet-crd-107.0.1+up0.13.1.tgz
       fleet_url:
         description: "Fleet chart URL from rancher/charts"
         required: true
-        default: https://github.com/rancher/charts/raw/dev-v2.9/assets/fleet/fleet-104.0.0+up0.10.0-rc.4.tgz
+        default: https://github.com/rancher/charts/raw/dev-v2.12/assets/fleet/fleet-107.0.1+up0.13.1.tgz
       image_repo:
         description: "Fleet image repo, the image name fleet/fleet-agent is to be appended later"
         required: true
@@ -33,7 +33,7 @@ on:
       image_tag:
         description: "Fleet image tag"
         required: true
-        default: "v0.10.0-rc.4"
+        default: "v0.13.1"
 
 env:
   GOARCH: amd64
@@ -46,12 +46,12 @@ jobs:
 
     steps:
       -
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.ref }}
       -
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version-file: 'go.mod'
           check-latest: true
@@ -61,17 +61,11 @@ jobs:
       -
         name: Determine cache key
         id: cache-key
-        run: |
-          DAY_OF_YEAR=$(date +%j)
-          if [ $(($DAY_OF_YEAR % 28)) -eq 0 ]; then
-            echo "value=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-          else
-            echo "value=latest" >> $GITHUB_OUTPUT
-          fi
+        run: ./.github/scripts/determine-cache-key.sh
       -
         name: Cache crust-gather CLI
         id: cache-crust
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
         with:
           path: ~/.local/bin/crust-gather
           key: ${{ runner.os }}-crust-gather-${{ steps.cache-key.outputs.value }}
@@ -85,7 +79,9 @@ jobs:
             mkdir -p ~/.local/bin
             if curl -sSfL https://github.com/crust-gather/crust-gather/raw/main/install.sh | sh -s -- --yes; then
               # Cache the binary for future runs
-              which crust-gather && cp $(which crust-gather) ~/.local/bin/
+              if [ ! -f ~/.local/bin/crust-gather ]; then
+                which crust-gather && cp $(which crust-gather) ~/.local/bin/
+              fi
             else
               echo "Failed to download crust-gather"
               exit 1
@@ -96,7 +92,7 @@ jobs:
             sudo ln -sf ~/.local/bin/crust-gather /usr/local/bin/
           fi
       -
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
         id: rancher-cli-cache
         with:
           path: /home/runner/.local/bin
@@ -105,10 +101,9 @@ jobs:
         name: Install Rancher CLI
         if: steps.rancher-cli-cache.outputs.cache-hit != 'true'
         run: |
-          # download an older CLI to avoid https://github.com/rancher/rancher/issues/37574
           mkdir -p /home/runner/.local/bin
-          wget -q https://github.com/rancher/cli/releases/download/v2.6.0/rancher-linux-amd64-v2.6.0.tar.gz
-          tar -xz --strip-components=2 -f rancher-linux-amd64-v2.6.0.tar.gz -C /home/runner/.local/bin
+          wget -q https://github.com/rancher/cli/releases/download/v2.12.0/rancher-linux-amd64-v2.12.0.tar.gz
+          tar -xz --strip-components=2 -f rancher-linux-amd64-v2.12.0.tar.gz -C /home/runner/.local/bin
           rancher --version
       -
         name: Install k3d
@@ -201,8 +196,12 @@ jobs:
         name: E2E tests for examples
         env:
           FLEET_E2E_NS: fleet-local
-          FLEET_E2E_NS_DOWNSTREAM: fleet-local
+          FLEET_E2E_NS_DOWNSTREAM: fleet-default
         run: |
+          # Force use of non-managed downstream cluster for portability
+          export CI_REGISTERED_CLUSTER=$(kubectl get clusters.fleet.cattle.io -n $FLEET_E2E_NS_DOWNSTREAM -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}' | grep -v second)
+
+          kubectl config use-context k3d-upstream
           ginkgo --github-output --trace e2e/multi-cluster
       -
         name: Dump Failed Downstream Environment
@@ -212,7 +211,7 @@ jobs:
           crust-gather collect --exclude-namespace=kube-system --exclude-kind=Lease --duration=5s -f tmp/downstream
       -
         name: Upload logs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: failure()
         with:
           name: gha-fleet-upgrade-rancher-logs-${{ github.event.inputs.rancher_version }}-${{ github.event.inputs.k3s_version }}-${{ github.sha }}-${{ github.run_id }}

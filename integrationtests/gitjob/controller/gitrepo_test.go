@@ -30,7 +30,7 @@ var _ = Describe("GitRepo", func() {
 		Expect(k8sClient.Create(ctx, ns)).ToNot(HaveOccurred())
 
 		p := make([]byte, 12)
-		s := rand.New(rand.NewSource(GinkgoRandomSeed())) // nolint:gosec // non-crypto usage
+		s := rand.New(rand.NewSource(GinkgoRandomSeed()))
 		if _, err := s.Read(p); err != nil {
 			panic(err)
 		}
@@ -65,7 +65,7 @@ var _ = Describe("GitRepo", func() {
 				g.Expect(gitrepo.Status.Display.Error).To(BeFalse())
 				g.Expect(gitrepo.Status.Conditions).To(HaveLen(5))
 				g.Expect(checkCondition(gitrepo, "GitPolling", corev1.ConditionTrue, "")).To(BeTrue())
-				g.Expect(checkCondition(gitrepo, "Reconciling", corev1.ConditionTrue, "")).To(BeTrue())
+				g.Expect(checkCondition(gitrepo, "Reconciling", corev1.ConditionFalse, "")).To(BeTrue())
 				g.Expect(checkCondition(gitrepo, "Stalled", corev1.ConditionFalse, "")).To(BeTrue())
 				g.Expect(checkCondition(gitrepo, "Ready", corev1.ConditionTrue, "")).To(BeTrue())
 				g.Expect(checkCondition(gitrepo, "Accepted", corev1.ConditionTrue, "")).To(BeTrue())

@@ -37,6 +37,7 @@ var (
 		collectClusterMetrics,
 	}
 
+	//nolint:dupl // Same pattern as in clustergroup metrics, but not the same definitions.
 	clusterMetrics = map[string]prometheus.Collector{
 		"desired_ready_git_repos": promauto.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -53,6 +54,24 @@ var (
 				Subsystem: clusterSubsystem,
 				Name:      "ready_git_repos",
 				Help:      "The number of GitRepos in a ready state.",
+			},
+			clusterLabels,
+		),
+		"desired_ready_helm_ops": promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: metricPrefix,
+				Subsystem: clusterSubsystem,
+				Name:      "desired_ready_helm_ops",
+				Help:      "The desired number of HelmOps to be in a ready state.",
+			},
+			clusterLabels,
+		),
+		"ready_helm_ops": promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: metricPrefix,
+				Subsystem: clusterSubsystem,
+				Name:      "ready_helm_ops",
+				Help:      "The number of HelmOps in a ready state.",
 			},
 			clusterLabels,
 		),
@@ -159,6 +178,10 @@ func collectClusterMetrics(obj any, metrics map[string]prometheus.Collector) {
 		With(labels).Set(float64(cluster.Status.DesiredReadyGitRepos))
 	metrics["ready_git_repos"].(*prometheus.GaugeVec).
 		With(labels).Set(float64(cluster.Status.ReadyGitRepos))
+	metrics["desired_ready_helm_ops"].(*prometheus.GaugeVec).
+		With(labels).Set(float64(cluster.Status.DesiredReadyHelmOps))
+	metrics["ready_helm_ops"].(*prometheus.GaugeVec).
+		With(labels).Set(float64(cluster.Status.ReadyHelmOps))
 	metrics["resources_count_desiredready"].(*prometheus.GaugeVec).
 		With(labels).Set(float64(cluster.Status.ResourceCounts.DesiredReady))
 	metrics["resources_count_missing"].(*prometheus.GaugeVec).

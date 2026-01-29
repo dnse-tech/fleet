@@ -3,8 +3,6 @@ package bundlereader
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io/fs"
@@ -15,32 +13,26 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
-	"github.com/hashicorp/go-getter"
+	"github.com/hashicorp/go-getter/v2"
+	"helm.sh/helm/v4/pkg/downloader"
+	helmgetter "helm.sh/helm/v4/pkg/getter"
+	"helm.sh/helm/v4/pkg/registry"
+
 	"github.com/rancher/fleet/internal/content"
 	"github.com/rancher/fleet/internal/helmupdater"
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
-	"helm.sh/helm/v3/pkg/downloader"
-	helmgetter "helm.sh/helm/v3/pkg/getter"
-	"helm.sh/helm/v3/pkg/registry"
 )
 
 var (
-	registryClient *registry.Client
-
-	fleetOciProvider = helmgetter.Provider{
-		Schemes: []string{registry.OCIScheme},
-		New:     NewFleetOCIProvider,
-	}
+	gitHTTPSCloneMutex sync.Mutex
 )
 
-func NewFleetOCIProvider(options ...helmgetter.Option) (helmgetter.Getter, error) {
-	if registryClient == nil {
-		return nil, fmt.Errorf("oci registry client is nil")
-	}
-
-	return helmgetter.NewOCIGetter(helmgetter.WithRegistryClient(registryClient))
+// Getter abstracts the go-getter client for testing.
+type Getter interface {
+	Get(ctx context.Context, req *getter.Request) (*getter.GetResult, error)
 }
 
 // ignoreTree represents a tree of ignored paths (read from .fleetignore files), each node being a directory.
@@ -92,7 +84,7 @@ func isAllFilesInDirPattern(path string) bool {
 func (xt *ignoreTree) addNode(dir string) error {
 	toIgnore, err := readFleetIgnore(dir)
 	if err != nil {
-		return fmt.Errorf("read .fleetignore for %s: %v", dir, err)
+		return fmt.Errorf("read .fleetignore for %s: %w", dir, err)
 	}
 
 	if len(toIgnore) == 0 {
@@ -127,9 +119,7 @@ func (xt *ignoreTree) findNode(path string, isDir bool, nodesRoute []*ignoreTree
 
 	for _, c := range xt.children {
 		if steps := c.findNode(path, isDir, nodesRoute); steps != nil {
-			crossed := append(nodesRoute, steps...)
-
-			return crossed
+			return append(nodesRoute, steps...)
 		}
 	}
 
@@ -196,7 +186,7 @@ func loadDirectory(ctx context.Context, opts loadOpts, dir directory) ([]fleet.B
 		if opts.compress || !utf8.Valid(data) {
 			content, err := content.Base64GZ(data)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("decoding compressed base64 data: %w", err)
 			}
 			r.Content = content
 			r.Encoding = "base64+gz"
@@ -225,10 +215,10 @@ func GetContent(ctx context.Context, base, source, version string, auth Auth, di
 	// go-getter does not support downloading OCI registry based files yet
 	// until this is implemented we use Helm to download charts from OCI based registries
 	// and provide the downloaded file to go-getter locally
-	if hasOCIURL.MatchString(source) {
+	if strings.HasPrefix(source, ociURLPrefix) {
 		source, err = downloadOCIChart(source, version, temp, auth)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("downloading OCI chart from %q: %w", orgSource, err)
 		}
 	}
 
@@ -248,27 +238,31 @@ func GetContent(ctx context.Context, base, source, version string, auth Auth, di
 		source += fmt.Sprintf("sshkey=%s", base64.StdEncoding.EncodeToString(auth.SSHPrivateKey))
 	}
 
-	// copy getter.Getters before changing
-	getters := map[string]getter.Getter{}
-	for k, v := range getter.Getters {
-		getters[k] = v
+	customGetters := []getter.Getter{}
+	for _, g := range getter.Getters {
+		// Replace default HTTP(S) getter with our customized one
+		if _, ok := g.(*getter.HttpGetter); ok {
+			continue
+		}
+		customGetters = append(customGetters, g)
 	}
 
 	httpGetter := newHttpGetter(auth)
-	getters["http"] = httpGetter
-	getters["https"] = httpGetter
+	customGetters = append(customGetters, httpGetter)
 
-	c := getter.Client{
-		Ctx:     ctx,
+	client := &getter.Client{
+		Getters: customGetters,
+	}
+
+	req := &getter.Request{
 		Src:     source,
 		Dst:     temp,
 		Pwd:     base,
-		Mode:    getter.ClientModeDir,
-		Getters: getters,
+		GetMode: getter.ModeDir,
 	}
 
-	if err := c.Get(); err != nil {
-		return nil, err
+	if err := get(ctx, client, req, auth); err != nil {
+		return nil, fmt.Errorf("retrieving file from %q: %w", source, err)
 	}
 
 	files := map[string][]byte{}
@@ -305,7 +299,7 @@ func GetContent(ctx context.Context, base, source, version string, auth Auth, di
 			// try to update possible dependencies.
 			if !disableDepsUpdate && helmupdater.ChartYAMLExists(path) {
 				if err = helmupdater.UpdateHelmDependencies(path); err != nil {
-					return err
+					return fmt.Errorf("updating helm dependencies: %w", err)
 				}
 			}
 			// Skip .fleetignore'd and hidden directories
@@ -356,10 +350,14 @@ func downloadOCIChart(name, version, path string, auth Auth) (string, error) {
 	defer os.RemoveAll(temp)
 
 	tmpGetter := newHttpGetter(auth)
-	registryClient, err = registry.NewClient(
+	clientOptions := []registry.ClientOption{
 		registry.ClientOptCredentialsFile(filepath.Join(temp, "creds.json")),
 		registry.ClientOptHTTPClient(tmpGetter.Client),
-	)
+	}
+	if auth.BasicHTTP {
+		clientOptions = append(clientOptions, registry.ClientOptPlainHTTP())
+	}
+	registryClient, err := registry.NewClient(clientOptions...)
 	if err != nil {
 		return "", err
 	}
@@ -387,11 +385,19 @@ func downloadOCIChart(name, version, path string, auth Auth) (string, error) {
 	if auth.Username != "" && auth.Password != "" {
 		getterOptions = append(getterOptions, helmgetter.WithBasicAuth(auth.Username, auth.Password))
 	}
-	getterOptions = append(getterOptions, helmgetter.WithInsecureSkipVerifyTLS(true))
+	getterOptions = append(getterOptions, helmgetter.WithInsecureSkipVerifyTLS(auth.InsecureSkipVerify))
 
 	c := downloader.ChartDownloader{
-		Verify:         downloader.VerifyNever,
-		Getters:        helmgetter.Providers{fleetOciProvider},
+		Verify:       downloader.VerifyNever,
+		ContentCache: path, // Required in Helm v4
+		Getters: helmgetter.Providers{
+			helmgetter.Provider{
+				Schemes: []string{registry.OCIScheme},
+				New: func(options ...helmgetter.Option) (helmgetter.Getter, error) {
+					return helmgetter.NewOCIGetter(helmgetter.WithRegistryClient(registryClient))
+				},
+			},
+		},
 		RegistryClient: registryClient,
 		Options:        getterOptions,
 	}
@@ -412,35 +418,69 @@ func downloadOCIChart(name, version, path string, auth Auth) (string, error) {
 	return saved, nil
 }
 
+// get performs the actual get operation, handling the mutex and environment variables for git-over-HTTPS operations.
+func get(ctx context.Context, client Getter, req *getter.Request, auth Auth) error {
+	if needsGitSSLEnvVars(req) {
+		gitHTTPSCloneMutex.Lock()
+		defer gitHTTPSCloneMutex.Unlock()
+	}
+
+	if auth.CABundle != nil {
+		file, err := os.CreateTemp("", "cabundle-*")
+		if err != nil {
+			return err
+		}
+		defer func() {
+			file.Close()
+			os.Remove(file.Name())
+		}()
+
+		if _, err := file.Write(auth.CABundle); err != nil {
+			return err
+		}
+
+		os.Setenv("GIT_SSL_CAINFO", file.Name())
+		defer os.Unsetenv("GIT_SSL_CAINFO")
+	}
+
+	if auth.InsecureSkipVerify {
+		os.Setenv("GIT_SSL_NO_VERIFY", "true")
+		defer os.Unsetenv("GIT_SSL_NO_VERIFY")
+	}
+
+	_, err := client.Get(ctx, req)
+	return err
+}
+
+// needsGitSSLEnvVars checks whether the request will use git over HTTPS with custom TLS settings that require
+// environment variables (and thus mutex protection).
+func needsGitSSLEnvVars(req *getter.Request) bool {
+	src := req.Src
+
+	// Check for explicit git::https:// prefix
+	if strings.HasPrefix(src, "git::https://") {
+		return true
+	}
+
+	// Check for shorthand URLs that go-getter's {BitBucket,GitHub,GitLab}Detector will transform to git::https://
+	// internally. The GitGetter.Detect() method strips the "git::" prefix when storing back to req.Src, so we need to
+	// detect these patterns directly. These patterns match what go-getter's detectors recognize.
+	if strings.HasPrefix(src, "github.com/") || strings.HasPrefix(src, "gitlab.com/") || strings.HasPrefix(src, "bitbucket.org/") {
+		return true
+	}
+
+	return false
+}
+
 func newHttpGetter(auth Auth) *getter.HttpGetter {
 	httpGetter := &getter.HttpGetter{
-		Client: &http.Client{},
+		Client: getHTTPClient(auth),
 	}
 
 	if auth.Username != "" && auth.Password != "" {
 		header := http.Header{}
 		header.Add("Authorization", "Basic "+basicAuth(auth.Username, auth.Password))
 		httpGetter.Header = header
-	}
-	if auth.CABundle != nil {
-		pool, err := x509.SystemCertPool()
-		if err != nil {
-			pool = x509.NewCertPool()
-		}
-		pool.AppendCertsFromPEM(auth.CABundle)
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = &tls.Config{
-			RootCAs:            pool,
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: auth.InsecureSkipVerify, // nolint:gosec
-		}
-		httpGetter.Client.Transport = transport
-	} else if auth.InsecureSkipVerify {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: auth.InsecureSkipVerify, // nolint:gosec
-		}
-		httpGetter.Client.Transport = transport
 	}
 
 	return httpGetter

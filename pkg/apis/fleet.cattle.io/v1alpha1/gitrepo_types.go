@@ -8,14 +8,13 @@ func init() {
 	InternalSchemeBuilder.Register(&GitRepo{}, &GitRepoList{})
 }
 
-var (
+const (
 	CommitLabel          = "fleet.cattle.io/commit"
 	RepoLabel            = "fleet.cattle.io/repo-name"
 	BundleLabel          = "fleet.cattle.io/bundle-name"
 	BundleNamespaceLabel = "fleet.cattle.io/bundle-namespace"
-)
+	CreatedByUserIDLabel = "fleet.cattle.io/created-by-user-id"
 
-const (
 	GitRepoAcceptedCondition = "Accepted"
 )
 
@@ -188,6 +187,9 @@ type GitRepoStatus struct {
 	// WebhookCommit is the latest Git commit hash received from a webhook
 	// +optional
 	WebhookCommit string `json:"webhookCommit,omitempty"`
+	// PollingCommit is the latest Git commit hash received from polling
+	// +optional
+	PollingCommit string `json:"pollingCommit,omitempty"`
 	// GitJobStatus is the status of the last Git job run, e.g. "Current" if there was no error.
 	GitJobStatus string `json:"gitJobStatus,omitempty"`
 	// LastSyncedImageScanTime is the time of the last image scan.

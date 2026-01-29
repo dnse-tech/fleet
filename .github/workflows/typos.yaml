@@ -8,8 +8,8 @@ jobs:
 
     steps:
     - name: Checkout Repository
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
     - name: Check spelling of file.txt
-      uses: crate-ci/typos@master
+      uses: crate-ci/typos@bb4666ad77b539a6b4ce4eda7ebb6de553704021 # v1.42.0
 

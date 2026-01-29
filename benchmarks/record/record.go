@@ -17,6 +17,7 @@ import (
 	gm "github.com/onsi/gomega/gmeasure"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 
 	"github.com/rancher/fleet/e2e/testenv/kubectl"
 	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
@@ -171,11 +172,12 @@ func Nodes(ctx context.Context, experiment *gm.Experiment) {
 		for _, image := range node.Status.Images {
 			name := ""
 			// in k3d, the first image name contains the hash, not the tag
-			if len(image.Names) == 0 {
+			switch {
+			case len(image.Names) == 0:
 				continue
-			} else if len(image.Names) > 1 {
+			case len(image.Names) > 1:
 				name = image.Names[1]
-			} else {
+			default:
 				name = image.Names[0]
 			}
 			images[name] = struct{}{}
@@ -234,7 +236,7 @@ func getMetrics(res map[string]float64, url string, controllers ...string) {
 	pod := addRandomSuffix("curl")
 	var (
 		mfs    map[string]*dto.MetricFamily
-		parser expfmt.TextParser
+		parser = expfmt.NewTextParser(model.LegacyValidation)
 	)
 	Eventually(func() error {
 		GinkgoWriter.Print("Fetching metrics from " + url + "\n")

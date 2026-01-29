@@ -17,6 +17,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/rancher/fleet/internal/cmd/controller/gitops"
 	"github.com/rancher/fleet/internal/cmd/controller/gitops/reconciler"
 	ctrlreconciler "github.com/rancher/fleet/internal/cmd/controller/reconciler"
 	"github.com/rancher/fleet/internal/cmd/controller/target"
@@ -89,6 +90,9 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).ToNot(HaveOccurred())
 
+	Expect(gitops.AddRepoNameLabelIndexer(ctx, mgr)).ToNot(HaveOccurred())
+	Expect(gitops.AddImageScanGitRepoIndexer(ctx, mgr)).ToNot(HaveOccurred())
+
 	ctlr := gomock.NewController(GinkgoT())
 
 	// redirect logs to a buffer that we can read in the tests
@@ -154,6 +158,8 @@ var _ = BeforeSuite(func() {
 		KnownHosts:      ssh.KnownHosts{},
 	}).SetupWithManager(mgr)
 	Expect(err).ToNot(HaveOccurred())
+
+	sched.Start(ctx)
 
 	err = (&reconciler.StatusReconciler{
 		Client:  mgr.GetClient(),

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/rancher/fleet/internal/config"
 	"github.com/rancher/fleet/internal/mocks"
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
@@ -23,7 +25,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 		ctrl                   *gomock.Controller
 		secretGetErrorMessage  string
 		secretGetNotFoundError bool
-		mockClient             *mocks.MockClient
+		mockClient             *mocks.MockK8sClient
 
 		secretName string
 		secretData map[string][]byte
@@ -32,9 +34,9 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 
 	JustBeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
-		mockClient = mocks.NewMockClient(ctrl)
+		mockClient = mocks.NewMockK8sClient(ctrl)
 		ns := types.NamespacedName{Name: secretName, Namespace: "test"}
-		getSecretFromMockClient(
+		getSecretFromMockK8sClient(
 			mockClient,
 			ns,
 			secretData,
@@ -61,7 +63,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 			secretGetNotFoundError = false
 		})
 		It("returns the expected OCIOpts from the data in the secret", func() {
-			ns := types.NamespacedName{Name: secretName, Namespace: "test"}
+			ns := client.ObjectKey{Name: secretName, Namespace: "test"}
 			opts, err := ReadOptsFromSecret(context.TODO(), mockClient, ns)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(opts.Reference).To(Equal(string(secretData[OCISecretReference])))
@@ -91,7 +93,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 			secretGetNotFoundError = false
 		})
 		It("returns the expected OCIOpts from the data in the secret", func() {
-			ns := types.NamespacedName{Name: secretName, Namespace: "test"}
+			ns := client.ObjectKey{Name: secretName, Namespace: "test"}
 			opts, err := ReadOptsFromSecret(context.TODO(), mockClient, ns)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(opts.Reference).To(Equal(string(secretData[OCISecretReference])))
@@ -116,7 +118,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 			secretGetNotFoundError = false
 		})
 		It("returns the expected OCIOpts from the data in the secret", func() {
-			ns := types.NamespacedName{Name: secretName, Namespace: "test"}
+			ns := client.ObjectKey{Name: secretName, Namespace: "test"}
 			opts, err := ReadOptsFromSecret(context.TODO(), mockClient, ns)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(opts.Reference).To(Equal(string(secretData[OCISecretReference])))
@@ -146,7 +148,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 			secretGetNotFoundError = false
 		})
 		It("returns an error complaining about reference not being set", func() {
-			ns := types.NamespacedName{Name: secretName, Namespace: "test"}
+			ns := client.ObjectKey{Name: secretName, Namespace: "test"}
 			_, err := ReadOptsFromSecret(context.TODO(), mockClient, ns)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(Equal("key \"reference\" not found in secret"))
@@ -160,7 +162,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 			secretGetErrorMessage = ""
 		})
 		It("returns an error complaining about a secret not being found", func() {
-			ns := types.NamespacedName{Name: secretName, Namespace: "test"}
+			ns := client.ObjectKey{Name: secretName, Namespace: "test"}
 			_, err := ReadOptsFromSecret(context.TODO(), mockClient, ns)
 			Expect(err).To(HaveOccurred())
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
@@ -175,7 +177,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 			secretGetErrorMessage = ""
 		})
 		It("returns an error complaining about wrong type", func() {
-			ns := types.NamespacedName{Name: secretName, Namespace: "test"}
+			ns := client.ObjectKey{Name: secretName, Namespace: "test"}
 			_, err := ReadOptsFromSecret(context.TODO(), mockClient, ns)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(Equal(fmt.Sprintf("unexpected secret type: got %q, want %q", secretType, fleet.SecretTypeOCIStorage)))
@@ -189,7 +191,7 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 			secretGetErrorMessage = "SOME ERROR"
 		})
 		It("returns the error", func() {
-			ns := types.NamespacedName{Name: secretName, Namespace: "test"}
+			ns := client.ObjectKey{Name: secretName, Namespace: "test"}
 			_, err := ReadOptsFromSecret(context.TODO(), mockClient, ns)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(Equal(secretGetErrorMessage))
@@ -197,36 +199,37 @@ var _ = Describe("OCIOpts loaded from secret", func() {
 	})
 })
 
-func getSecretFromMockClient(
-	mockClient *mocks.MockClient,
+func getSecretFromMockK8sClient(
+	mockClient *mocks.MockK8sClient,
 	ns types.NamespacedName,
 	data map[string][]byte,
 	secretType string,
 	wantNotFound bool,
 	wantErrorMessage string) {
-	if wantErrorMessage != "" {
+	switch {
+	case wantErrorMessage != "":
 		mockClient.EXPECT().Get(gomock.Any(), ns, gomock.Any()).DoAndReturn(
 			func(_ context.Context, _ types.NamespacedName, secret *corev1.Secret, _ ...interface{}) error {
 				return errors.New(wantErrorMessage)
 			},
 		)
-	} else if wantNotFound {
+	case wantNotFound:
 		mockClient.EXPECT().Get(gomock.Any(), ns, gomock.Any()).DoAndReturn(
 			func(_ context.Context, _ types.NamespacedName, secret *corev1.Secret, _ ...interface{}) error {
 				return apierrors.NewNotFound(schema.GroupResource{}, "TEST ERROR")
 			},
 		)
-	} else if ns.Name == "" {
+	case ns.Name == "":
 		// verify that when the name is not set it uses the default secret name.
 		mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 			func(_ context.Context, key types.NamespacedName, secret *corev1.Secret, _ ...interface{}) error {
-				Expect(key.Name).To(Equal(OCIStorageDefaultSecretName))
+				Expect(key.Name).To(Equal(config.DefaultOCIStorageSecretName))
 				secret.Data = data
 				secret.Type = corev1.SecretType(secretType)
 				return nil
 			},
 		)
-	} else if ns.Name != "" {
+	default:
 		mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 			func(_ context.Context, key types.NamespacedName, secret *corev1.Secret, _ ...interface{}) error {
 				Expect(ns.Name).To(Equal(key.Name))

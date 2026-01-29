@@ -3,6 +3,38 @@
     "enable": ["goimports"]
   },
   "linters": {
+    "default": "none",
+    "enable": [
+      "bodyclose",
+      "contextcheck",
+      "copyloopvar",
+      "dupl",
+      "durationcheck",
+      "errcheck",
+      "errorlint",
+      "funlen",
+      "ginkgolinter",
+      "gocritic",
+      "gocyclo",
+      "gosec",
+      "govet",
+      "ineffassign",
+      "loggercheck",
+      "makezero",
+      "misspell",
+      "nakedret",
+      "nilerr",
+      "noctx",
+      "nolintlint",
+      "revive",
+      "staticcheck",
+      "testifylint",
+      "thelper",
+      "unconvert",
+      "unparam",
+      "unused",
+      "usestdlibvars"
+    ],
     "exclusions": {
       "generated": "lax",
       "presets": [

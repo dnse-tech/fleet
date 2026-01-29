@@ -11,30 +11,26 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	httpgit "github.com/go-git/go-git/v5/plumbing/transport/http"
 	gossh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
-
-	giturls "github.com/rancher/fleet/pkg/git-urls"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/rancher/fleet/internal/cmd/cli/gitcloner/submodule"
+	fleetgithub "github.com/rancher/fleet/internal/github"
 	fleetssh "github.com/rancher/fleet/internal/ssh"
+	giturls "github.com/rancher/fleet/pkg/git-urls"
 )
 
 const defaultBranch = "master"
 
 var (
-	plainClone = git.PlainClone
-	readFile   = os.ReadFile
+	plainClone                                 = git.PlainClone
+	updateSubmodules                           = submodule.UpdateSubmodules
+	readFile                                   = os.ReadFile
+	fileStat                                   = os.Stat
+	appAuthGetter    fleetgithub.AppAuthGetter = fleetgithub.DefaultAppAuthGetter{}
 )
 
 type Cloner struct{}
-
-type Options struct {
-	Repo            string
-	Branch          string
-	Auth            transport.AuthMethod
-	InsecureSkipTLS bool
-	CABundle        []byte
-}
 
 func New() *Cloner {
 	return &Cloner{}
@@ -85,29 +81,45 @@ func (c *Cloner) CloneRepo(opts *GitCloner) error {
 }
 
 func cloneBranch(opts *GitCloner, auth transport.AuthMethod, caBundle []byte) error {
-	_, err := plainClone(opts.Path, false, &git.CloneOptions{
+	r, err := plainClone(opts.Path, false, &git.CloneOptions{
 		URL:               opts.Repo,
+		Depth:             1,
 		Auth:              auth,
 		InsecureSkipTLS:   opts.InsecureSkipTLS,
 		CABundle:          caBundle,
 		SingleBranch:      true,
 		ReferenceName:     plumbing.ReferenceName(opts.Branch),
-		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+		RecurseSubmodules: git.NoRecurseSubmodules,
+		Tags:              git.NoTags,
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to clone repo from branch %s: %w", repo(opts), err)
+		return fmt.Errorf("failed to clone main repo from branch %s: %w, skipping submodule clone", repo(opts), err)
 	}
+
+	submoduleUpdateOptions := &git.SubmoduleUpdateOptions{
+		Init:              true,
+		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+		Depth:             1,
+		Auth:              auth,
+	}
+
+	if err := updateSubmodules(r, submoduleUpdateOptions); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func cloneRevision(opts *GitCloner, auth transport.AuthMethod, caBundle []byte) error {
 	r, err := plainClone(opts.Path, false, &git.CloneOptions{
 		URL:               opts.Repo,
+		Depth:             1,
 		Auth:              auth,
 		InsecureSkipTLS:   opts.InsecureSkipTLS,
 		CABundle:          caBundle,
-		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+		RecurseSubmodules: git.NoRecurseSubmodules,
+		Tags:              git.NoTags,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to clone repo from revision %s: %w", repo(opts), err)
@@ -123,6 +135,17 @@ func cloneRevision(opts *GitCloner, auth transport.AuthMethod, caBundle []byte) 
 
 	if err := w.Checkout(&git.CheckoutOptions{Hash: *h}); err != nil {
 		return fmt.Errorf("failed to checkout in worktree %s: %w", repo(opts), err)
+	}
+
+	submoduleUpdateOptions := &git.SubmoduleUpdateOptions{
+		Init:              true,
+		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+		Depth:             1,
+		Auth:              auth,
+	}
+
+	if err := updateSubmodules(r, submoduleUpdateOptions); err != nil {
+		return err
 	}
 
 	return nil
@@ -163,17 +186,39 @@ func createAuthFromOpts(opts *GitCloner) (transport.AuthMethod, error) {
 
 			auth.HostKeyCallback = knownHostsCallBack
 		} else {
-			//nolint G106: Use of ssh InsecureIgnoreHostKey should be audited
-			//this will run in an init-container, so there is no persistence
+			//nolint:gosec // G106: Use of ssh InsecureIgnoreHostKey should be audited - this will run in an init-container, so there is no persistence
 			auth.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 		}
 		return auth, nil
 	}
 
-	if opts.Username != "" && opts.PasswordFile != "" {
+	if opts.GitHubAppID != 0 && opts.GitHubAppInstallation != 0 && opts.GitHubAppKeyFile != "" {
+		if _, err := fileStat(opts.GitHubAppKeyFile); err != nil {
+			return nil, fmt.Errorf("failed to resolve GitHub app private key from path: %w", err)
+		}
+
+		key, err := readFile(opts.GitHubAppKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read GitHub app private key from file: %w", err)
+		}
+
+		auth, err := appAuthGetter.Get(opts.GitHubAppID, opts.GitHubAppInstallation, key)
+		if err != nil {
+			return nil, err
+		}
+		return auth, nil
+	}
+
+	if opts.PasswordFile != "" {
 		password, err := readFile(opts.PasswordFile)
 		if err != nil {
 			return nil, err
+		}
+
+		if len(opts.Username) == 0 {
+			return &httpgit.BasicAuth{
+				Username: string(password),
+			}, nil
 		}
 
 		return &httpgit.BasicAuth{

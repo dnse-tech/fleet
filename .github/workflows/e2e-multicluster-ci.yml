@@ -20,11 +20,11 @@ jobs:
 
     steps:
       -
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
       -
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version-file: 'go.mod'
           check-latest: true
@@ -34,21 +34,11 @@ jobs:
       -
         name: Determine cache key
         id: cache-key
-        run: |
-          # Get the day of year (1-366)
-          DAY_OF_YEAR=$(date +%j)
-          
-          # Use modulo to create a key that changes every 28 days
-          if [ $(($DAY_OF_YEAR % 28)) -eq 0 ]; then
-            # On the 28th, 56th, 84th... day of the year, use a date-based key
-            echo "value=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-          else
-            echo "value=latest" >> $GITHUB_OUTPUT
-          fi
+        run: ./.github/scripts/determine-cache-key.sh
       -
         name: Cache crust-gather CLI
         id: cache-crust
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
         with:
           path: ~/.local/bin/crust-gather
           key: ${{ runner.os }}-crust-gather-${{ steps.cache-key.outputs.value }}
@@ -62,7 +52,9 @@ jobs:
             mkdir -p ~/.local/bin
             if curl -sSfL https://github.com/crust-gather/crust-gather/raw/main/install.sh | sh -s -- --yes; then
               # Cache the binary for future runs
-              which crust-gather && cp $(which crust-gather) ~/.local/bin/
+              if [ ! -f ~/.local/bin/crust-gather ]; then
+                which crust-gather && cp $(which crust-gather) ~/.local/bin/
+              fi
             else
               echo "Failed to download crust-gather"
               exit 1
@@ -254,7 +246,7 @@ jobs:
           crust-gather collect --exclude-namespace=kube-system --exclude-kind=Lease --duration=5s -f tmp/downstream
       -
         name: Upload Logs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: failure()
         with:
           name: gha-fleet-mc-e2e-logs-${{ github.sha }}-${{ github.run_id }}

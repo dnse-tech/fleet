@@ -3,6 +3,7 @@ package git
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net/http"
 	"time"
 
@@ -13,8 +14,11 @@ import (
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 
+	fleetgithub "github.com/rancher/fleet/internal/github"
 	fleetssh "github.com/rancher/fleet/internal/ssh"
 )
+
+var GitHubAppGetter fleetgithub.AppAuthGetter = fleetgithub.DefaultAppAuthGetter{}
 
 // GetAuthFromSecret returns the AuthMethod calculated from the given secret, setting known hosts if needed.
 // Known hosts are sourced from the creds, if provided there. Otherwise, they will be sourced from the provided
@@ -29,8 +33,14 @@ func GetAuthFromSecret(url string, creds *corev1.Secret, knownHosts string) (tra
 	switch creds.Type {
 	case corev1.SecretTypeBasicAuth:
 		username, password := creds.Data[corev1.BasicAuthUsernameKey], creds.Data[corev1.BasicAuthPasswordKey]
-		if len(password) == 0 && len(username) == 0 {
-			return nil, nil
+		if len(username) == 0 {
+			if len(password) == 0 {
+				return nil, nil
+			}
+
+			return &httpgit.BasicAuth{
+				Username: string(password),
+			}, nil
 		}
 		return &httpgit.BasicAuth{
 			Username: string(username),
@@ -45,28 +55,37 @@ func GetAuthFromSecret(url string, creds *corev1.Secret, knownHosts string) (tra
 		if err != nil {
 			return nil, err
 		}
-		if creds.Data["known_hosts"] != nil {
+		switch {
+		case creds.Data["known_hosts"] != nil:
 			auth.HostKeyCallback, err = fleetssh.CreateKnownHostsCallBack(creds.Data["known_hosts"])
 			if err != nil {
 				return nil, err
 			}
-		} else if len(knownHosts) > 0 {
+		case len(knownHosts) > 0:
 			auth.HostKeyCallback, err = fleetssh.CreateKnownHostsCallBack([]byte(knownHosts))
 			if err != nil {
 				return nil, err
 			}
-		} else {
-			//nolint G106: Use of ssh InsecureIgnoreHostKey should be audited
+		default:
+			//nolint:gosec // G106: Use of ssh InsecureIgnoreHostKey should be audited
 			auth.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 		}
 		return auth, nil
+	default:
+		auth, err := fleetgithub.GetGithubAppAuthFromSecret(creds, GitHubAppGetter)
+		if err != nil {
+			if errors.Is(err, fleetgithub.ErrNotGithubAppSecret) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return auth, nil
 	}
-	return nil, nil
 }
 
 // GetHTTPClientFromSecret returns a HTTP client filled from the information in the given secret
 // and optional CABundle and insecureTLSVerify
-func GetHTTPClientFromSecret(creds *corev1.Secret, CABundle []byte, insecureTLSVerify bool, timeout time.Duration) (*http.Client, error) {
+func GetHTTPClientFromSecret(creds *corev1.Secret, bundleCA []byte, insecureTLSVerify bool, timeout time.Duration) (*http.Client, error) {
 	var (
 		username  string
 		password  string
@@ -87,8 +106,8 @@ func GetHTTPClientFromSecret(creds *corev1.Secret, CABundle []byte, insecureTLSV
 		}
 	}
 
-	if len(CABundle) > 0 {
-		cert, err := x509.ParseCertificate(CABundle)
+	if len(bundleCA) > 0 {
+		cert, err := x509.ParseCertificate(bundleCA)
 		if err != nil {
 			return nil, err
 		}

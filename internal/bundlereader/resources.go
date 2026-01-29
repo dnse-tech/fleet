@@ -19,11 +19,11 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-var hasOCIURL = regexp.MustCompile(`^oci:\/\/`)
+const ociURLPrefix = "oci://"
 
 // readResources reads and downloads all resources from the bundle. Resources
 // can be downloaded and are spread across multiple directories.
-func readResources(ctx context.Context, spec *fleet.BundleSpec, compress bool, base string, auth Auth, helmRepoURLRegex string) ([]fleet.BundleResource, error) {
+func readResources(ctx context.Context, spec *fleet.BundleSpec, compress bool, base string, auth Auth, helmRepoURLRegex, bundleFile string) ([]fleet.BundleResource, error) {
 	directories, err := addDirectory(base, ".", ".")
 	if err != nil {
 		return nil, err
@@ -50,7 +50,7 @@ func readResources(ctx context.Context, spec *fleet.BundleSpec, compress bool, b
 		}
 	}
 
-	directories, err = addRemoteCharts(directories, base, chartDirs, auth, helmRepoURLRegex)
+	directories, err = addRemoteCharts(ctx, directories, base, chartDirs, auth, helmRepoURLRegex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to add directory for chart: %w", err)
 	}
@@ -64,7 +64,7 @@ func readResources(ctx context.Context, spec *fleet.BundleSpec, compress bool, b
 	loadOpts := loadOpts{
 		compress:           compress,
 		disableDepsUpdate:  disableDepsUpdate,
-		ignoreApplyConfigs: ignoreApplyConfigs(spec.Helm, spec.Targets...),
+		ignoreApplyConfigs: ignoreApplyConfigs(bundleFile, spec.Helm, spec.Targets...),
 	}
 	resources, err := loadDirectories(ctx, loadOpts, directories...)
 	if err != nil {
@@ -93,20 +93,34 @@ type loadOpts struct {
 // ignoreApplyConfigs returns a list of config files that should not be added to the
 // bundle's resources. Their contents are converted into deployment options.
 // This includes:
-// * fleet.yaml
+// * bundle file (typically named fleet.yaml, but may be arbitrarily named when user-driven bundle scan is used)
 // * spec.Helm.ValuesFiles
 // * spec.Targets[].Helm.ValuesFiles
-func ignoreApplyConfigs(spec *fleet.HelmOptions, targets ...fleet.BundleTarget) []string {
-	ignore := []string{"fleet.yaml"}
+func ignoreApplyConfigs(bundleFile string, spec *fleet.HelmOptions, targets ...fleet.BundleTarget) []string {
+	ignore := []string{"fleet.yaml", bundleFile}
+
+	// Values files may be referenced from `fleet.yaml` files either with their file name
+	// alone, or with a directory prefix, for instance for a chart directory.
+	// Values files must be ignored in both cases, and determining which of the filename or full path will be needed
+	// depends on where the `fleet.yaml` file lives relatively to the values file(s) which it references.
 	if spec != nil {
 		ignore = append(ignore, spec.ValuesFiles...)
+
+		for _, vf := range spec.ValuesFiles {
+			ignore = append(ignore, filepath.Base(vf))
+		}
 	}
 
 	for _, target := range targets {
 		if target.Helm == nil {
 			continue
 		}
+
 		ignore = append(ignore, target.Helm.ValuesFiles...)
+
+		for _, vf := range target.Helm.ValuesFiles {
+			ignore = append(ignore, filepath.Base(vf))
+		}
 	}
 
 	return ignore
@@ -191,18 +205,19 @@ func mergeGenericMap(first, second *fleet.GenericMap) *fleet.GenericMap {
 // addRemoteCharts gets the chart url from a helm repo server and returns a `directory` struct.
 // For every chart that is not on disk, create a directory struct that contains the charts URL as path.
 // This adds one directory per HelmOption.
-func addRemoteCharts(directories []directory, base string, charts []*fleet.HelmOptions, auth Auth, helmRepoURLRegex string) ([]directory, error) {
+func addRemoteCharts(ctx context.Context, directories []directory, base string, charts []*fleet.HelmOptions, auth Auth, helmRepoURLRegex string) ([]directory, error) {
 	for _, chart := range charts {
 		if _, err := os.Stat(filepath.Join(base, chart.Chart)); os.IsNotExist(err) || chart.Repo != "" {
 			shouldAddAuthToRequest, err := shouldAddAuthToRequest(helmRepoURLRegex, chart.Repo, chart.Chart)
 			if err != nil {
 				return nil, fmt.Errorf("failed to add auth to request for %s: %w", downloadChartError(*chart), err)
 			}
+			auth := auth // loop-scoped variable
 			if !shouldAddAuthToRequest {
 				auth = Auth{}
 			}
 
-			chartURL, err := chartURL(*chart, auth)
+			chartURL, err := ChartURL(ctx, *chart, auth, false)
 			if err != nil {
 				return nil, fmt.Errorf("failed to resolve URL of %s: %w", downloadChartError(*chart), err)
 			}
@@ -243,7 +258,7 @@ func checksum(helm *fleet.HelmOptions) string {
 	if helm == nil {
 		return "none"
 	}
-	return fmt.Sprintf(".chart/%x", sha256.Sum256([]byte(helm.Chart + ":" + helm.Repo + ":" + helm.Version)[:]))
+	return fmt.Sprintf(".chart/%x", sha256.Sum256([]byte(helm.Chart+":"+helm.Repo+":"+helm.Version)))
 }
 
 // loadDirectories loads all resources from a bundle's directories
@@ -267,7 +282,6 @@ func loadDirectories(ctx context.Context, opts loadOpts, directories ...director
 			continue
 		}
 		alreadyLoaded[dirId] = struct{}{}
-		dir := dir
 		eg.Go(func() error {
 			if err := sem.Acquire(ctx, 1); err != nil {
 				return fmt.Errorf("waiting to load directory %s, %s: %w", dir.prefix, dir.base, err)
